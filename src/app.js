@@ -48,7 +48,7 @@ function sessionMiddleware(req, res, next) {
     if (session && typeof session === "object" && !Array.isArray(session))
       req.session = session;
   } catch {}
-  const before = JSON.stringify(req.session);
+  const before = rails.stringify(req.session);
   try {
     if (rails.decode64(req.session._csrf_token).length !== 32)
       delete req.session._csrf_token;
@@ -104,7 +104,7 @@ function sessionMiddleware(req, res, next) {
       path: "/",
     };
     const expiry = new Date(Date.now() + options.maxAge);
-    if (JSON.stringify(req.session) !== before)
+    if (rails.stringify(req.session) !== before)
       res.cookie(
         "_campfire_session",
         rails.encryptCookie("_campfire_session", req.session, expiry),

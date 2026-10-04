@@ -237,14 +237,14 @@ export function signCookie(name, value, expiry = null) {
 }
 function cookieValue(raw, name) {
   if (raw.toString().startsWith('{"_rails":{"message":"')) {
-    const m = JSON.parse(raw)._rails;
+    const m = parseJSON(raw.toString())._rails;
     if (m.pur && m.pur !== "cookie." + name)
       throw new Error("invalid cookie purpose");
     if (m.exp && !(new Date(m.exp).getTime() > clock().getTime()))
       throw new Error("expired cookie");
     raw = decode64(m.message);
   }
-  return JSON.parse(raw.toString());
+  return parseJSON(raw.toString());
 }
 export function verifyCookie(name, raw) {
   raw = decodeURIComponent(raw);

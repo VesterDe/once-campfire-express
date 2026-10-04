@@ -436,3 +436,93 @@ test("failed image create and edit leave existing message body, attachments and 
     await new Promise((resolve) => server.close(resolve));
   }
 });
+test("room namespaces cannot promote direct history or bypass shared room administration", async () => {
+  const time = now();
+  const directId = Number(
+    run(
+      "INSERT INTO rooms(type,creator_id,created_at,updated_at) VALUES('Rooms::Direct',?,?,?)",
+      admin.id,
+      time,
+      time,
+    ).lastInsertRowid,
+  );
+  const direct = get("SELECT * FROM rooms WHERE id=?", directId);
+  domain.grantMemberships(direct, [admin.id, member.id]);
+  const sessionToken = "namespace-member-session";
+  run(
+    "INSERT INTO sessions(user_id,token,created_at,updated_at,last_active_at) VALUES(?,?,?,?,?)",
+    member.id,
+    sessionToken,
+    time,
+    time,
+    time,
+  );
+  const server = createServer(createApp());
+  await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  const auth =
+    "session_token=" +
+    encodeURIComponent(rails.signCookie("session_token", sessionToken));
+  try {
+    const loginPage = await fetch(base + "/rooms/" + open.id, {
+      headers: { cookie: auth },
+    });
+    const csrf = (await loginPage.text()).match(
+      /name="csrf-token" content="([^"]+)"/,
+    )[1];
+    const cookie =
+      auth +
+      "; " +
+      loginPage.headers
+        .getSetCookie()
+        .map((c) => c.split(";")[0])
+        .join("; ");
+    const snapshot = () =>
+      JSON.stringify({
+        rooms: all("SELECT * FROM rooms ORDER BY id"),
+        memberships: all("SELECT * FROM memberships ORDER BY id"),
+      });
+    const initial = snapshot();
+    const cases = [
+      ["GET", "/rooms/unknown", 404],
+      ["GET", `/rooms/opens/${direct.id}/edit`, 404],
+      ["PATCH", `/rooms/opens/${direct.id}`, 404],
+      ["DELETE", `/rooms/opens/${direct.id}`, 404],
+      ["GET", `/rooms/closeds/${direct.id}/edit`, 404],
+      ["PATCH", `/rooms/closeds/${direct.id}`, 404],
+      ["GET", `/rooms/directs/${open.id}/edit`, 404],
+      ["DELETE", `/rooms/directs/${open.id}`, 404],
+      ["PATCH", `/rooms/directs/${open.id}`, 404],
+      ["PATCH", `/rooms/directs/${direct.id}`, 405],
+      ["PUT", `/rooms/directs/${direct.id}`, 405],
+      ["DELETE", `/rooms/opens/${open.id}`, 403],
+    ];
+    for (const [method, path, expected] of cases) {
+      const response = await fetch(base + path, {
+        method,
+        redirect: "manual",
+        headers: {
+          cookie,
+          "x-csrf-token": csrf,
+          "content-type": "application/x-www-form-urlencoded",
+        },
+        ...(method === "GET"
+          ? {}
+          : {
+              body: new URLSearchParams({
+                "room[name]": "Leaked",
+                "user_ids[]": outsider.id,
+              }),
+            }),
+      });
+      assert.equal(response.status, expected, method + " " + path);
+      assert.equal(
+        snapshot(),
+        initial,
+        method + " " + path + " changed persisted access",
+      );
+    }
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
+});

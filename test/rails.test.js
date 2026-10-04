@@ -146,3 +146,12 @@ test("Bounded data-only Marshal decoder reads independent Ruby storage transform
   assert.throws(() => r.unpack(Buffer.from([4, 8, 111])));
   assert.throws(() => r.unpack(Buffer.from([4, 8, 91, 255])));
 });
+test("Encrypted Rails sessions preserve custom integer values beyond JavaScript safe precision", () => {
+  const value = { session_id: "native-test", custom_id: 9007199254740993n };
+  const token = r.encryptCookie("_campfire_session", value);
+  assert.deepEqual(r.decryptCookie("_campfire_session", token), value);
+  assert.equal(
+    r.stringify(r.decryptCookie("_campfire_session", token)),
+    r.stringify(value),
+  );
+});

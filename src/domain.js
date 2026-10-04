@@ -35,7 +35,7 @@ export function messagesForRoom(id, { before, after, around } = {}) {
       Number(around),
       Number(id),
     );
-    if (!pivot) return [];
+    if (!pivot) return messagesForRoom(id);
     return [
       ...all(
         presentation +

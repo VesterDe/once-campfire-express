@@ -338,6 +338,7 @@ export function registerRoutes(app) {
     ["/rooms/:roomId", "/rooms/:roomId/@:messageId"],
     login,
     (req, res) => {
+      if (!/^\d+$/.test(req.params.roomId)) return res.sendStatus(404);
       const room = roomForUser(req.user, req.params.roomId);
       if (!room) return res.redirect("/");
       req.lastRoom = room.id;
@@ -614,6 +615,15 @@ function registerRoomForms(app) {
       if (!["opens", "closeds", "directs"].includes(kind)) return next();
       let room = id ? roomForUser(req.user, id) : null;
       if (id && !room) return res.sendStatus(404);
+      // Direct conversations have their own scope; shared rooms may switch open/closed.
+      if (room && (room.type === "Rooms::Direct") !== (kind === "directs"))
+        return res.sendStatus(404);
+      if (
+        room &&
+        kind === "directs" &&
+        !["GET", "HEAD", "DELETE"].includes(req.method)
+      )
+        return res.sendStatus(405);
       const type =
         "Rooms::" + kind.slice(0, -1)[0].toUpperCase() + kind.slice(1, -1);
       if (room && req.method === "DELETE") {
