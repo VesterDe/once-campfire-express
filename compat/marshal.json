@@ -1,0 +1,41 @@
+[
+  {
+    "marshal": "BAh7BjoUdHJhbnNmb3JtYXRpb25zewc6FHJlc2l6ZV90b19saW1pdFsHaQKwBGkCIAM6C2Zvcm1hdEkiCGpwZwY6BkVU",
+    "expected": {
+      "transformations": {
+        "resize_to_limit": [
+          1200,
+          800
+        ],
+        "format": "jpg"
+      }
+    }
+  },
+  {
+    "marshal": "BAh7BzoLZm9ybWF0Ogl3ZWJwOhNyZXNpemVfdG9fZmlsbFsHaQIsAWkCLAE=",
+    "expected": {
+      "format": "webp",
+      "resize_to_fill": [
+        300,
+        300
+      ]
+    }
+  },
+  {
+    "marshal": "BAhJIhpnaWQ6Ly9jYW1wZmlyZS9Vc2VyLzIGOgZFVA==",
+    "expected": "gid://campfire/User/2"
+  },
+  {
+    "marshal": "BAhbDWkGafppAgABaf8AZggxLjVURjA=",
+    "expected": [
+      1,
+      -1,
+      256,
+      -256,
+      1.5,
+      true,
+      false,
+      null
+    ]
+  }
+]

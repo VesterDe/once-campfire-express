@@ -1,0 +1,32 @@
+{
+  "name": "once-campfire-express",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24.15.0"
+  },
+  "scripts": {
+    "start": "node src/server.js",
+    "test": "node bin/test.js",
+    "build:assets": "node bin/build-assets.js",
+    "format": "prettier --write src/*.js bin/*.js test/*.js",
+    "format:check": "prettier --check src/*.js bin/*.js test/*.js"
+  },
+  "dependencies": {
+    "bcryptjs": "3.0.3",
+    "compression": "1.8.2",
+    "express": "5.2.1",
+    "multer": "2.4.0",
+    "nunjucks": "3.2.4",
+    "parse5": "8.0.1",
+    "qrcode": "1.5.4",
+    "sanitize-html": "2.18.0",
+    "sharp": "0.35.5",
+    "web-push": "3.6.7",
+    "ws": "8.22.0"
+  },
+  "devDependencies": {
+    "prettier": "3.9.9"
+  }
+}
