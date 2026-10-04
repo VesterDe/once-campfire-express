@@ -121,7 +121,7 @@ export async function perform(kind, data) {
       "SELECT body FROM action_text_rich_texts WHERE record_type='Message' AND record_id=?",
       message.id,
     )?.body || "";
-  const { plainText } = await import("./richtext.js");
+  const { messagePlainText } = await import("./richtext.js");
   async function reply(text, attachment = null) {
     let result;
     try {
@@ -179,7 +179,9 @@ export async function perform(kind, data) {
         id: message.id,
         body: {
           html: body,
-          plain: plainText(body).replaceAll(`@${hook.name}`, "").trim(),
+          plain: messagePlainText(message.id, body)
+            .replaceAll(`@${hook.name}`, "")
+            .trim(),
         },
         path: `/rooms/${message.room_id}/@${message.id}`,
       },
@@ -239,8 +241,8 @@ export async function perform(kind, data) {
       options: {
         body:
           message.room_type === "Rooms::Direct"
-            ? plainText(body)
-            : `${message.creator_name}: ${plainText(body)}`,
+            ? messagePlainText(message.id, body)
+            : `${message.creator_name}: ${messagePlainText(message.id, body)}`,
         data: {
           path: `/rooms/${message.room_id}`,
           badge: get(

@@ -526,3 +526,26 @@ test("room namespaces cannot promote direct history or bypass shared room admini
     await new Promise((resolve) => server.close(resolve));
   }
 });
+
+test("Attachment-only bot JSON and notification text use the original filename", async () => {
+  const { messagePlainText } = await import("../src/richtext.js");
+  const { serializeMessage } = await import("../src/routes.js");
+  const message = domain.createMessage(open.id, admin.id, "");
+  storeUpload(
+    {
+      buffer: Buffer.from("attachment-only"),
+      originalname: "contract-file.txt",
+      mimetype: "text/plain",
+    },
+    "Message",
+    message.id,
+    "attachment",
+  );
+  assert.equal(messagePlainText(message.id, ""), "contract-file.txt");
+  assert.equal(messagePlainText(message.id, "<p>Caption</p>"), "Caption");
+  const req = { protocol: "http", get: () => "example.test" };
+  assert.equal(
+    serializeMessage(message, req).body.plain_text,
+    "contract-file.txt",
+  );
+});

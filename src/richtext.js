@@ -266,3 +266,14 @@ export function renderBody(body) {
     },
   );
 }
+
+export function messagePlainText(messageId, body = "") {
+  return (
+    plainText(body) ||
+    get(
+      "SELECT b.filename FROM active_storage_attachments a JOIN active_storage_blobs b ON b.id=a.blob_id WHERE a.record_type='Message' AND a.record_id=? AND a.name='attachment'",
+      messageId,
+    )?.filename ||
+    ""
+  );
+}

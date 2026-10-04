@@ -27,7 +27,7 @@ import {
   iso,
   epoch,
 } from "./rendering.js";
-import { escape, plainText } from "./richtext.js";
+import { escape, plainText, messagePlainText } from "./richtext.js";
 import * as rails from "./rails.js";
 import { publish } from "./cable.js";
 import {
@@ -166,7 +166,7 @@ export function serializeMessage(m, req) {
     id: m.id,
     created_at: iso(m.created_at),
     body: {
-      plain_text: plainText(body),
+      plain_text: messagePlainText(m.id, body),
       html: '<div class="lexxy-content">' + body + "</div>",
     },
     creator: {
