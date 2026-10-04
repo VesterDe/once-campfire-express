@@ -26,6 +26,23 @@ reference is immutable and pinned at `659f957`.
 See [verification](plans/contracts.md) for tested workflows and remaining limits,
 and [benchmark commands](bench/README.md) for the production comparison.
 
+## Benchmarks
+
+Measured with 16 concurrent clients on an AMD Ryzen AI MAX+ 395,
+with four hardware threads allocated to each app.
+
+| Requests/second | Rails | Express |
+|---|---:|---:|
+| Room | 241 | 559 |
+| Messages | 413 | 777 |
+| Sidebar | 552 | 4,125 |
+| Search | 435 | 1,294 |
+| Post message | 273 | 256 |
+
+At 100 WebSocket connections and five messages/second, median delivery to every
+connection was 24 ms for Rails and 14 ms for Express. Every message reached every
+connection in both runs.
+
 ## Known differences
 
 - TLS terminates at a configured proxy.
