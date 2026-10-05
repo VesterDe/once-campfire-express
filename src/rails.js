@@ -1,4 +1,5 @@
 import {
+  createSecretKey,
   createHmac,
   pbkdf2Sync,
   timingSafeEqual,
@@ -13,15 +14,18 @@ let clock = () => new Date();
 export function setClock(fn) {
   clock = fn || (() => new Date());
 }
+// Only integers with 16+ digits can be unsafe; skip the reviver otherwise.
 export const parseJSON = (text) =>
-  JSON.parse(text, (k, v, context) =>
-    typeof v === "number" &&
-    Number.isInteger(v) &&
-    !Number.isSafeInteger(v) &&
-    /^-?\d+$/.test(context.source || "")
-      ? BigInt(context.source)
-      : v,
-  );
+  !/\d{16}/.test(text)
+    ? JSON.parse(text)
+    : JSON.parse(text, (k, v, context) =>
+        typeof v === "number" &&
+        Number.isInteger(v) &&
+        !Number.isSafeInteger(v) &&
+        /^-?\d+$/.test(context.source || "")
+          ? BigInt(context.source)
+          : v,
+      );
 export const stringify = (value) =>
   JSON.stringify(value, (k, v) =>
     typeof v === "bigint" ? JSON.rawJSON(v.toString()) : v,
@@ -43,7 +47,21 @@ export function decode64(value) {
     throw new Error("invalid base64");
   return Buffer.from(value, "base64");
 }
+const fastKeys = new Map();
 export function key(salt, length = 64) {
+  const hit = fastKeys.get(length === 64 ? salt : salt + "\0" + length);
+  if (hit !== undefined && hit.secret === process.env.SECRET_KEY_BASE)
+    return hit.key;
+  return slowKey(salt, length).key;
+}
+// KeyObjects avoid re-importing raw key bytes on every HMAC/cipher call.
+function keyObject(salt, length = 64) {
+  const hit = fastKeys.get(length === 64 ? salt : salt + "\0" + length);
+  if (hit !== undefined && hit.secret === process.env.SECRET_KEY_BASE)
+    return hit.object;
+  return slowKey(salt, length).object;
+}
+function slowKey(salt, length) {
   const secret = process.env.SECRET_KEY_BASE;
   if (!secret) throw new Error("SECRET_KEY_BASE is required");
   const id = JSON.stringify([secret, salt, length]);
@@ -51,10 +69,24 @@ export function key(salt, length = 64) {
     if (keys.size >= 64) keys.clear();
     keys.set(id, pbkdf2Sync(secret, salt, 1000, length, "sha256"));
   }
-  return keys.get(id);
+  const raw = keys.get(id);
+  const entry = { secret, key: raw, object: createSecretKey(raw) };
+  if (fastKeys.size >= 64) fastKeys.clear();
+  fastKeys.set(length === 64 ? salt : salt + "\0" + length, entry);
+  return entry;
+}
+let pool = Buffer.alloc(0),
+  poolOffset = 0;
+// Small random values come from a pooled CSPRNG buffer.
+function random(n) {
+  if (poolOffset + n > pool.length) {
+    pool = randomBytes(8192);
+    poolOffset = 0;
+  }
+  return pool.subarray(poolOffset, (poolOffset += n));
 }
 const mac = (data, salt, algorithm = "sha1") =>
-  createHmac(algorithm, key(salt)).update(data).digest("hex");
+  createHmac(algorithm, keyObject(salt)).update(data).digest("hex");
 export function equal(a, b) {
   const x = Buffer.from(a),
     y = Buffer.from(b);
@@ -235,31 +267,66 @@ export function signCookie(name, value, expiry = null) {
   const p = b64(cookieEnvelope(name, value, expiry));
   return p + "--" + mac(p, "signed cookie");
 }
-function cookieValue(raw, name) {
+function cookieValue(raw, name, meta) {
   if (raw.toString().startsWith('{"_rails":{"message":"')) {
     const m = parseJSON(raw.toString())._rails;
     if (m.pur && m.pur !== "cookie." + name)
       throw new Error("invalid cookie purpose");
     if (m.exp && !(new Date(m.exp).getTime() > clock().getTime()))
       throw new Error("expired cookie");
+    if (meta && m.exp) meta.exp = new Date(m.exp).getTime();
     raw = decode64(m.message);
   }
   return parseJSON(raw.toString());
 }
-export function verifyCookie(name, raw) {
+// Cookie strings repeat on every request: cache the verified/decrypted
+// payload by raw string. Expiry is checked again on each hit and every hit
+// returns a fresh copy, because handlers mutate the session.
+const cookieCache = new Map();
+function cachedCookie(kind, name, raw) {
+  const id = kind + "\0" + name + "\0" + raw;
+  let e = cookieCache.get(id);
+  if (e === undefined || e.secret !== process.env.SECRET_KEY_BASE) {
+    const meta = { exp: null };
+    e = { secret: process.env.SECRET_KEY_BASE, exp: null };
+    try {
+      e.json = stringify(
+        (kind === "e" ? decryptCookie : verifyCookie)(name, raw, meta),
+      );
+      e.exp = meta.exp;
+    } catch (error) {
+      e.error = error;
+    }
+    if (cookieCache.size >= 10000) cookieCache.clear();
+    cookieCache.set(id, e);
+  }
+  if (e.error) throw e.error;
+  if (e.exp !== null && !(e.exp > clock().getTime()))
+    throw new Error("expired cookie");
+  return e.json === undefined ? undefined : parseJSON(e.json);
+}
+export const verifyCookieCached = (name, raw) =>
+  typeof raw === "string"
+    ? cachedCookie("s", name, raw)
+    : verifyCookie(name, raw);
+export const decryptCookieCached = (name, raw) =>
+  typeof raw === "string"
+    ? cachedCookie("e", name, raw)
+    : decryptCookie(name, raw);
+export function verifyCookie(name, raw, meta) {
   raw = decodeURIComponent(raw);
   const i = raw.lastIndexOf("--");
   if (i < 0) throw new Error("invalid cookie");
   const p = raw.slice(0, i);
   if (!equal(raw.slice(i + 2), mac(p, "signed cookie")))
     throw new Error("invalid cookie signature");
-  return cookieValue(decode64(p), name);
+  return cookieValue(decode64(p), name, meta);
 }
 export function encryptCookie(name, value, expiry = null, options = {}) {
-  const nonce = options.nonce || randomBytes(12),
+  const nonce = options.nonce || random(12),
     cipher = createCipheriv(
       "aes-256-gcm",
-      key("authenticated encrypted cookie", 32),
+      keyObject("authenticated encrypted cookie", 32),
       nonce,
     );
   const data = Buffer.concat([
@@ -268,7 +335,7 @@ export function encryptCookie(name, value, expiry = null, options = {}) {
   ]);
   return [data, nonce, cipher.getAuthTag()].map(b64).join("--");
 }
-export function decryptCookie(name, raw) {
+export function decryptCookie(name, raw, meta) {
   const parts = decodeURIComponent(raw).split("--");
   if (parts.length !== 3) throw new Error("invalid cookie");
   const [data, nonce, tag] = parts.map(decode64);
@@ -276,13 +343,14 @@ export function decryptCookie(name, raw) {
     throw new Error("invalid cookie");
   const cipher = createDecipheriv(
     "aes-256-gcm",
-    key("authenticated encrypted cookie", 32),
+    keyObject("authenticated encrypted cookie", 32),
     nonce,
   );
   cipher.setAuthTag(tag);
   return cookieValue(
     Buffer.concat([cipher.update(data), cipher.final()]),
     name,
+    meta,
   );
 }
 function modelPurpose(model, purpose) {
@@ -399,11 +467,10 @@ export function unverifiedUserGid(raw) {
 }
 export function maskCsrf(raw) {
   if (raw.length !== 32) throw new Error("invalid CSRF secret");
-  const pad = randomBytes(32);
-  return Buffer.concat([
-    pad,
-    Buffer.from(raw.map((x, i) => x ^ pad[i])),
-  ]).toString("base64url");
+  const out = Buffer.allocUnsafe(64);
+  random(32).copy(out);
+  for (let i = 0; i < 32; i++) out[32 + i] = raw[i] ^ out[i];
+  return out.toString("base64url");
 }
 export function validCsrf(raw, token, path = null, method = null) {
   try {
@@ -413,17 +480,19 @@ export function validCsrf(raw, token, path = null, method = null) {
     if (v.length === 64)
       v = Buffer.from(v.subarray(0, 32).map((x, i) => x ^ v[i + 32]));
     if (v.length !== 32) return false;
-    const candidates = [
-      raw,
-      createHmac("sha256", raw).update("!real_csrf_token").digest(),
-    ];
-    if (path != null && method != null)
-      candidates.push(
+    if (equal(v, raw)) return true;
+    if (equal(v, createHmac("sha256", raw).update("!real_csrf_token").digest()))
+      return true;
+    return (
+      path != null &&
+      method != null &&
+      equal(
+        v,
         createHmac("sha256", raw)
           .update(path.replace(/\/$/, "") + "#" + method.toLowerCase())
           .digest(),
-      );
-    return candidates.some((c) => equal(v, c));
+      )
+    );
   } catch {
     return false;
   }
