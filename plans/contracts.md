@@ -34,3 +34,20 @@ higher tail latency than Rails; the table reports the median, not a capacity lim
 The unchanged common load generator and original seed hashes are recorded in ignored
 scratch evidence. Benchmark orchestration is Ruby, and server processes share four
 hardware threads; Express uses three HTTP workers and its primary job/fanout process.
+
+## Page and message HTML caches
+
+Room, messages-page, sidebar, search and single-message pages are cached per
+process (`src/rendering.js`): one entry per message (key: message id + origin,
+checked against the presentation row) and one entry per page (key: route
+inputs, full user row, host, protocol, Turbo-Frame, session last room). All
+entries are dropped when `epoch()` in `src/db.js` moves, which happens on any
+commit from any process. The decoded HTML is byte-identical to an uncached
+render except for the random CSRF token. Deliberate differences: gzip bytes
+are made by the app (one stored gzip for pages without a token; for pages with
+a token, a prebuilt stream whose token bytes are patched per request), so the
+compressed bytes and the `ETag` values differ from what the compression
+middleware and Express would make; brotli, deflate, identity and HEAD still
+go through the normal middleware. Verified by decoding with Node zlib, Ruby
+`Zlib::GzipReader` and `curl --compressed` against the uncached code on a
+seeded database before and after boosts, edits, renames and posts.
