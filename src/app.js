@@ -76,6 +76,29 @@ function lookupSession(token) {
   session.status = user.status;
   return [session, user];
 }
+// The same incoming cookie that turns into the same new session (for example
+// the room page setting last_room_id on every visit) reuses the value encrypted
+// less than a second ago. Only the embedded expiry can lag by under a second.
+const sessionCookies = new Map();
+function sessionCookie(incoming, json, session, expiry) {
+  const key = (incoming || "") + "\0" + json;
+  const hit = sessionCookies.get(key);
+  if (
+    hit &&
+    hit.secret === process.env.SECRET_KEY_BASE &&
+    hit.expiry <= expiry &&
+    expiry - hit.expiry < 1000
+  )
+    return hit.value;
+  const value = rails.encryptCookie("_campfire_session", session, expiry);
+  if (sessionCookies.size >= 10000) sessionCookies.clear();
+  sessionCookies.set(key, {
+    value,
+    expiry,
+    secret: process.env.SECRET_KEY_BASE,
+  });
+  return value;
+}
 // Process-local copies of rarely changing rows, dropped when epoch() moves.
 let cachedEpoch = null,
   cachedAccount,
@@ -160,10 +183,11 @@ function sessionMiddleware(req, res, next) {
       path: "/",
     };
     const expiry = new Date(Date.now() + options.maxAge);
-    if (rails.stringify(req.session) !== before)
+    const after = rails.stringify(req.session);
+    if (after !== before)
       res.cookie(
         "_campfire_session",
-        rails.encryptCookie("_campfire_session", req.session, expiry),
+        sessionCookie(req.cookies._campfire_session, after, req.session, expiry),
         options,
       );
     if (req.clearSessionToken)
@@ -252,10 +276,8 @@ function wrap(req, res, method, next) {
         callback = encoding;
         encoding = undefined;
       }
-      if (chunk == null || this.headersSent) {
-        res.pageCapture = null;
+      if (chunk == null || this.headersSent)
         return end.call(this, chunk, encoding, callback);
-      }
       if (typeof chunk === "string")
         chunk = Buffer.from(chunk, encoding || "utf8");
       if (
@@ -276,7 +298,6 @@ function wrap(req, res, method, next) {
           this.setHeader("Content-Length", chunk.length);
         }
       }
-      if (res.pageCapture) res.pageCapture(chunk);
       return end.call(this, chunk, callback);
     };
     next();
