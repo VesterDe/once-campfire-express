@@ -10,7 +10,7 @@ import {
 import { publish } from "./cable.js";
 import { stream } from "./rails.js";
 import { fragment, messageData } from "./rendering.js";
-import { enqueue, enqueueMany } from "./jobs.js";
+import { enqueue, enqueueMany, permittedPushEndpoint } from "./jobs.js";
 export const userById = (id) =>
   get("SELECT * FROM users WHERE id=?", Number(id));
 export const roomsForUser = (id) =>
@@ -324,6 +324,15 @@ export function announceMessage(message, html, room) {
   publishMessage(message, "append", html, room, members);
   notifyMessage(message, {}, room, members);
 }
+function pushableUsers(roomId) {
+  const users = new Set();
+  for (const s of all(
+    "SELECT p.user_id,p.endpoint FROM push_subscriptions p JOIN memberships m ON m.user_id=p.user_id WHERE m.room_id=?",
+    roomId,
+  ))
+    if (permittedPushEndpoint(s.endpoint)) users.add(s.user_id);
+  return users;
+}
 export function notifyMessage(
   message,
   { webhooks = true } = {},
@@ -344,6 +353,8 @@ export function notifyMessage(
       : new Set(),
     room = knownRoom || get("SELECT * FROM rooms WHERE id=?", message.room_id);
   const jobs = [];
+  // A push job only for users with a subscription Rails would deliver to.
+  let pushable = null;
   for (const m of members ||
     all(
       "SELECT m.*,u.role,u.status FROM memberships m JOIN users u ON u.id=m.user_id WHERE m.room_id=? AND m.user_id<>?",
@@ -359,6 +370,7 @@ export function notifyMessage(
       for (const w of all("SELECT id FROM webhooks WHERE user_id=?", m.user_id))
         jobs.push(["webhook", { webhook_id: w.id, message_id: message.id }]);
     if (
+      (pushable ??= pushableUsers(message.room_id)).has(m.user_id) &&
       (!m.connected_at ||
         Date.now() - Date.parse(m.connected_at + "Z") > 60000) &&
       (m.involvement === "everything" ||
