@@ -1,6 +1,9 @@
 import nunjucks from "nunjucks";
 import { readFileSync, existsSync } from "node:fs";
-import { all, get } from "./db.js";
+import { randomUUID } from "node:crypto";
+import { createRequire } from "node:module";
+import zlib from "node:zlib";
+import { all, get, epoch as dbEpoch } from "./db.js";
 import * as rails from "./rails.js";
 import { escape, plainText, renderBody } from "./richtext.js";
 import { blobUrl, representationUrl } from "./storage.js";
@@ -11,9 +14,16 @@ const env = new nunjucks.Environment(
   { autoescape: true },
 );
 const safe = (value) => new nunjucks.runtime.SafeString(value || "");
+const generatedMemo = new Map();
 function generated(name, fallback = "") {
-  const path = new URL(`../assets/generated/${name}`, import.meta.url);
-  return existsSync(path) ? readFileSync(path, "utf8") : fallback;
+  const k = name + "\0" + fallback;
+  let v = generatedMemo.get(k);
+  if (v === undefined) {
+    const path = new URL(`../assets/generated/${name}`, import.meta.url);
+    v = existsSync(path) ? readFileSync(path, "utf8") : fallback;
+    generatedMemo.set(k, v);
+  }
+  return v;
 }
 let manifest;
 export function asset(name) {
@@ -31,11 +41,30 @@ export function epoch(value) {
 export function iso(value) {
   return new Date(epoch(value)).toISOString();
 }
+// Signed ids depend on SECRET_KEY_BASE too, so it is part of every memo key.
+const avatarMemo = new Map();
 export function avatar(id, updated) {
-  return (
-    `/users/${rails.signedId("User", Number(id), "avatar")}/avatar` +
-    (updated ? "?v=" + versionTime(updated) : "")
-  );
+  const k = id + "|" + updated + "|" + process.env.SECRET_KEY_BASE;
+  let v = avatarMemo.get(k);
+  if (v === undefined) {
+    v =
+      `/users/${rails.signedId("User", Number(id), "avatar")}/avatar` +
+      (updated ? "?v=" + versionTime(updated) : "");
+    if (avatarMemo.size >= 10000) avatarMemo.clear();
+    avatarMemo.set(k, v);
+  }
+  return v;
+}
+const streamMemo = new Map();
+export function signStream(name) {
+  const k = name + "|" + process.env.SECRET_KEY_BASE;
+  let v = streamMemo.get(k);
+  if (v === undefined) {
+    v = rails.signStream(name);
+    if (streamMemo.size >= 10000) streamMemo.clear();
+    streamMemo.set(k, v);
+  }
+  return v;
 }
 export function versionTime(value) {
   return new Date(epoch(value))
@@ -58,13 +87,31 @@ export function userData(user) {
     Administer: user.role === 1,
   };
 }
-export function roomData(room, user) {
+// Members of many direct rooms in one query; same order as roomData's own query.
+export function directMembers(roomIds) {
+  const map = new Map();
+  if (!roomIds.length) return map;
+  for (const id of roomIds) map.set(id, []);
+  for (const u of all(
+    `SELECT m.room_id AS member_room_id,u.* FROM users u JOIN memberships m ON m.user_id=u.id WHERE m.room_id IN (${roomIds.map(() => "?").join(",")}) ORDER BY u.name`,
+    ...roomIds,
+  )) {
+    const list = map.get(u.member_room_id);
+    delete u.member_room_id;
+    list.push(u);
+  }
+  return map;
+}
+export function roomData(room, user, membersByRoom = null) {
   const kind = (room.type || "Rooms::Open").split("::").pop().toLowerCase();
   const members =
     kind === "direct"
-      ? all(
-          "SELECT u.* FROM users u JOIN memberships m ON m.user_id=u.id WHERE m.room_id=? ORDER BY u.name",
-          room.id,
+      ? (
+          membersByRoom?.get(room.id) ||
+          all(
+            "SELECT u.* FROM users u JOIN memberships m ON m.user_id=u.id WHERE m.room_id=? ORDER BY u.name",
+            room.id,
+          )
         ).filter((u) => u.id !== user?.id)
       : [];
   return {
@@ -103,8 +150,15 @@ export function messageData(messages, origin = "") {
     `SELECT b.*,u.name,u.bio,u.updated_at AS booster_updated_at FROM boosts b JOIN users u ON u.id=b.booster_id WHERE b.message_id IN (${placeholders}) ORDER BY b.created_at`,
     ...ids,
   );
+  const boostsByMessage = new Map();
+  for (const b of boosts) {
+    let list = boostsByMessage.get(b.message_id);
+    if (!list) boostsByMessage.set(b.message_id, (list = []));
+    list.push(b);
+  }
   return messages.map((m) => {
     const blob = blobs.get(m.id);
+    const text = plainText(bodies.get(m.id));
     let body = renderBody(bodies.get(m.id) || "");
     let url = "";
     if (blob) {
@@ -133,12 +187,8 @@ export function messageData(messages, origin = "") {
       CreatedAt: m.created_at,
       UpdatedAt: m.updated_at,
       HTML: safe('<div class="lexxy-content">' + body + "</div>"),
-      AllEmoji:
-        !!plainText(bodies.get(m.id)) &&
-        !/[\p{L}\p{N}]/u.test(plainText(bodies.get(m.id))),
-      Boosts: boosts
-        .filter((b) => b.message_id === m.id)
-        .map((b) => ({
+      AllEmoji: !!text && !/[\p{L}\p{N}]/u.test(text),
+      Boosts: (boostsByMessage.get(m.id) || []).map((b) => ({
           ID: b.id,
           MessageID: b.message_id,
           BoosterID: b.booster_id,
