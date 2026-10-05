@@ -1,3 +1,4 @@
+import "./workers_env.js";
 import cluster from "node:cluster";
 import http from "node:http";
 import { initialize } from "./db.js";
