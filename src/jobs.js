@@ -15,6 +15,27 @@ import {
   stagedFiles,
 } from "./storage.js";
 
+// Rails Push::Subscription: deliver only to https on port 443 at a permitted push service host.
+const PERMITTED_PUSH_HOSTS = [
+  "jmt17.google.com",
+  "fcm.googleapis.com",
+  "updates.push.services.mozilla.com",
+  "web.push.apple.com",
+  "notify.windows.com",
+];
+export function permittedPushEndpoint(endpoint) {
+  if (!endpoint || /\s/.test(endpoint)) return false;
+  let url;
+  try {
+    url = new URL(endpoint);
+  } catch {
+    return false;
+  }
+  if (url.protocol !== "https:" || (url.port !== "" && url.port !== "443"))
+    return false;
+  const host = url.hostname.toLowerCase();
+  return PERMITTED_PUSH_HOSTS.some((h) => host === h || host.endsWith("." + h));
+}
 let connection,
   timer,
   working = false,
@@ -308,6 +329,7 @@ export async function perform(kind, data) {
       "SELECT * FROM push_subscriptions WHERE user_id=?",
       data.user_id,
     )) {
+      if (!permittedPushEndpoint(subscription.endpoint)) continue;
       let resolved;
       try {
         resolved = await resolvePublic(subscription.endpoint);
