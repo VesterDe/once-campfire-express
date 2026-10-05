@@ -89,10 +89,60 @@ export function now() {
     .replace("Z", "")
     .replace(/(\.\d{3})$/, "$1000");
 }
+// SQLite's busy handler sleeps 1-10ms per retry while holding the whole process.
+// Take the write lock with short, growing waits instead (20µs to 1ms, 10s overall).
+const pause = new Int32Array(new SharedArrayBuffer(4));
+const busy = (error) => (error?.errcode & 0xff) === 5;
+function begin() {
+  const c = db();
+  c.exec("PRAGMA busy_timeout=0");
+  try {
+    let deadline = 0;
+    for (let wait = 0.02; ; wait = Math.min(wait * 1.5, 1)) {
+      try {
+        c.exec("BEGIN IMMEDIATE");
+        return;
+      } catch (error) {
+        if (!busy(error)) throw error;
+        deadline ||= Date.now() + 10000;
+        if (Date.now() > deadline) throw error;
+      }
+      Atomics.wait(pause, 0, 0, wait);
+    }
+  } finally {
+    c.exec("PRAGMA busy_timeout=10000");
+  }
+}
+// Like transaction(), but while another process holds the write lock this process
+// keeps serving other work: it retries BEGIN IMMEDIATE from the event loop.
+let begun = false;
+export async function writeTransaction(fn) {
+  if (depth) return transaction(fn);
+  const c = db();
+  let deadline = 0;
+  for (;;) {
+    c.exec("PRAGMA busy_timeout=0");
+    try {
+      c.exec("BEGIN IMMEDIATE");
+      begun = true;
+      break;
+    } catch (error) {
+      if (!busy(error)) throw error;
+      deadline ||= Date.now() + 10000;
+      if (Date.now() > deadline) throw error;
+    } finally {
+      c.exec("PRAGMA busy_timeout=10000");
+    }
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  return transaction(fn);
+}
 export function transaction(fn) {
   const name = `nested_${depth}`,
     nested = depth > 0;
-  db().exec(nested ? `SAVEPOINT ${name}` : "BEGIN IMMEDIATE");
+  if (nested) db().exec(`SAVEPOINT ${name}`);
+  else if (begun) begun = false;
+  else begin();
   depth++;
   callbacks.push([]);
   let result, hooks;
