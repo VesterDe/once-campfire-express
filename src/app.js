@@ -3,8 +3,10 @@ import compression from "compression";
 import multer from "multer";
 import path from "node:path";
 import { randomBytes } from "node:crypto";
+import zlib from "node:zlib";
+import { createRequire } from "node:module";
 import * as rails from "./rails.js";
-import { get, run, now, initialize } from "./db.js";
+import { get, all, run, now, initialize, epoch } from "./db.js";
 import { registerRoutes } from "./routes.js";
 import { registerStorage } from "./storage.js";
 import { registerPublic } from "./public.js";
@@ -25,7 +27,7 @@ export function parseCookies(header = "") {
 }
 export function authenticateCookies(header) {
   try {
-    const token = rails.verifyCookie(
+    const token = rails.verifyCookieCached(
       "session_token",
       parseCookies(header).session_token,
     );
@@ -37,11 +39,48 @@ export function authenticateCookies(header) {
     return null;
   }
 }
+// One query for the session and its user; "__s_" columns belong to the session.
+const SESSION_USER_SQL =
+  "SELECT s.id AS __s_id,s.created_at AS __s_created_at,s.ip_address AS __s_ip_address,s.last_active_at AS __s_last_active_at,s.token AS __s_token,s.updated_at AS __s_updated_at,s.user_agent AS __s_user_agent,s.user_id AS __s_user_id,u.* FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token=? AND u.status=0";
+function sessionAndUser(cookies) {
+  let row;
+  try {
+    row = get(
+      SESSION_USER_SQL,
+      rails.verifyCookieCached("session_token", cookies.session_token),
+    );
+  } catch {
+    return [null, null];
+  }
+  if (!row) return [null, null];
+  const session = {},
+    user = {};
+  for (const k in row)
+    if (k.startsWith("__s_")) session[k.slice(4)] = row[k];
+    else user[k] = row[k];
+  session.name = user.name;
+  session.role = user.role;
+  session.status = user.status;
+  return [session, user];
+}
+// Process-local copies of rarely changing rows, dropped when epoch() moves.
+let cachedEpoch = null,
+  cachedAccount,
+  cachedBans;
+function refreshCaches(e) {
+  if (e !== cachedEpoch || e < 0) {
+    cachedAccount = get("SELECT * FROM accounts ORDER BY id LIMIT 1");
+    cachedBans = new Set(
+      all("SELECT ip_address FROM bans").map((r) => r.ip_address),
+    );
+    cachedEpoch = e;
+  }
+}
 function sessionMiddleware(req, res, next) {
   req.cookies = parseCookies(req.headers.cookie);
   req.session = {};
   try {
-    const session = rails.decryptCookie(
+    const session = rails.decryptCookieCached(
       "_campfire_session",
       req.cookies._campfire_session,
     );
@@ -58,25 +97,23 @@ function sessionMiddleware(req, res, next) {
   req.session.session_id ||= randomBytes(16).toString("hex");
   req.session._csrf_token ||= rails.b64(randomBytes(32));
   req.csrfToken = rails.maskCsrf(rails.decode64(req.session._csrf_token));
-  req.currentSession = authenticateCookies(req.headers.cookie);
-  req.user = req.currentSession
-    ? get("SELECT * FROM users WHERE id=?", req.currentSession.user_id)
-    : null;
-  req.account = get("SELECT * FROM accounts ORDER BY id LIMIT 1");
+  [req.currentSession, req.user] = sessionAndUser(req.cookies);
   req.authenticatedByBot = false;
-  const botMatch = req.path.match(/^\/rooms\/\d+\/([^/]+)\/messages(?:\/|$)/);
-  const botKey = req.query.bot_key || botMatch?.[1];
-  if (!req.user && botKey) {
-    const m = String(botKey)
-      .trim()
-      .match(/^(\d+)-(.+)$/);
-    if (m) {
-      req.user = get(
-        "SELECT * FROM users WHERE id=? AND bot_token=? AND status=0 AND role=2",
-        Number(m[1]),
-        m[2],
-      );
-      req.authenticatedByBot = Boolean(req.user);
+  if (!req.user) {
+    const botMatch = req.path.match(/^\/rooms\/\d+\/([^/]+)\/messages(?:\/|$)/);
+    const botKey = req.query.bot_key || botMatch?.[1];
+    if (botKey) {
+      const m = String(botKey)
+        .trim()
+        .match(/^(\d+)-(.+)$/);
+      if (m) {
+        req.user = get(
+          "SELECT * FROM users WHERE id=? AND bot_token=? AND status=0 AND role=2",
+          Number(m[1]),
+          m[2],
+        );
+        req.authenticatedByBot = Boolean(req.user);
+      }
     }
   }
   if (
@@ -94,6 +131,9 @@ function sessionMiddleware(req, res, next) {
       req.ip,
       req.currentSession.id,
     );
+  req.epoch = epoch();
+  refreshCaches(req.epoch);
+  req.account = cachedAccount && { ...cachedAccount };
   const writeHead = res.writeHead;
   res.writeHead = function (...args) {
     const options = {
@@ -144,6 +184,176 @@ function multipartFields(req, res, next) {
   }
   next();
 }
+// Whole-body responses are gzipped synchronously at level 1 (faster than the
+// compression() stream + threadpool hop). Streams, br/deflate clients and
+// bodies that already carry Content-Encoding fall through to compression().
+const compressionRequire = createRequire(
+  createRequire(import.meta.url).resolve("compression"),
+);
+const Negotiator = compressionRequire("negotiator"),
+  vary = compressionRequire("vary");
+const negotiated = new Map();
+function contentCoding(header) {
+  if (!header) return "identity";
+  let method = negotiated.get(header);
+  if (method === undefined) {
+    method =
+      new Negotiator({ headers: { "accept-encoding": header } }).encoding(
+        ["br", "gzip", "deflate", "identity"],
+        ["br", "gzip"],
+      ) || "";
+    if (negotiated.size >= 1000) negotiated.clear();
+    negotiated.set(header, method);
+  }
+  return method;
+}
+const HOT_PATH =
+  /^\/(?:rooms\/\d+(?:\/messages)?|users\/me\/sidebar|searches)$/;
+const NO_TRANSFORM = /(?:^|,)\s*?no-transform\s*?(?:,|$)/;
+function encodingMiddleware() {
+  const compress = compression();
+  return (req, res, next) => {
+    const method = contentCoding(req.headers["accept-encoding"]);
+    if (
+      method === "br" ||
+      method === "deflate" ||
+      req.method !== "GET" ||
+      !HOT_PATH.test(req.path)
+    )
+      compress(req, res, () => wrap(req, res, method, next));
+    else wrap(req, res, method, next);
+  };
+}
+// Runs after compression() so this end() is the outer one the handler calls.
+function wrap(req, res, method, next) {
+  {
+    const end = res.end;
+    res.end = function (chunk, encoding, callback) {
+      if (typeof chunk === "function") {
+        callback = chunk;
+        chunk = undefined;
+      } else if (typeof encoding === "function") {
+        callback = encoding;
+        encoding = undefined;
+      }
+      if (chunk == null || this.headersSent) {
+        res.pageCapture = null;
+        return end.call(this, chunk, encoding, callback);
+      }
+      if (typeof chunk === "string")
+        chunk = Buffer.from(chunk, encoding || "utf8");
+      if (
+        compression.filter(req, res) &&
+        !NO_TRANSFORM.test(this.getHeader("Cache-Control") || "")
+      ) {
+        vary(this, "Accept-Encoding");
+        if (
+          method === "gzip" &&
+          req.method !== "HEAD" &&
+          this.statusCode !== 204 &&
+          this.statusCode !== 304 &&
+          !this.getHeader("Content-Encoding") &&
+          Number(this.getHeader("Content-Length") ?? chunk.length) >= 1024
+        ) {
+          chunk = zlib.gzipSync(chunk, { level: 1 });
+          this.setHeader("Content-Encoding", "gzip");
+          this.setHeader("Content-Length", chunk.length);
+        }
+      }
+      if (res.pageCapture) res.pageCapture(chunk);
+      return end.call(this, chunk, callback);
+    };
+    next();
+  }
+}
+// Whole-response cache for the hot authenticated GET pages. Entries are valid
+// only while epoch() is unchanged (no write in any process), and the key holds
+// everything the page reads from the request. A hit replays the handler's
+// session changes and headers, so cookies are written exactly as on a miss.
+const PAGE_LIMIT = 32 * 1024 * 1024;
+const PAGE_HEADERS = new Set([
+  "x-content-type-options",
+  "x-frame-options",
+  "referrer-policy",
+  "content-type",
+  "content-length",
+  "content-encoding",
+  "vary",
+]);
+const pages = new Map();
+let pageBytes = 0,
+  pageEpoch = null;
+function pageCache(req, res, next) {
+  if (
+    req.method !== "GET" ||
+    !req.user ||
+    req.authenticatedByBot ||
+    req.format ||
+    req.epoch < 0 ||
+    !HOT_PATH.test(req.path)
+  )
+    return next();
+  if (pageEpoch !== req.epoch) {
+    pages.clear();
+    pageBytes = 0;
+    pageEpoch = req.epoch;
+  }
+  const h = req.headers;
+  const key = [
+    req.originalUrl,
+    req.user.id,
+    req.session._csrf_token,
+    req.session.last_room_id ?? "",
+    req.protocol,
+    h.host ?? "",
+    h["turbo-frame"] ?? "",
+    h.accept ?? "",
+    h["accept-encoding"] ?? "",
+  ].join("\n");
+  const hit = pages.get(key);
+  if (hit !== undefined) {
+    for (const [k, v] of hit.session)
+      if (v === undefined) delete req.session[k];
+      else req.session[k] = rails.parseJSON(v);
+    if (hit.lastRoom !== undefined) req.lastRoom = hit.lastRoom;
+    res.statusCode = 200;
+    for (const [k, v] of hit.headers) res.setHeader(k, v);
+    res.pageCapture = null;
+    res.end(hit.body);
+    return;
+  }
+  const before = new Map(
+    Object.keys(req.session).map((k) => [k, rails.stringify(req.session[k])]),
+  );
+  res.pageCapture = (body) => {
+    res.pageCapture = null;
+    if (
+      res.statusCode !== 200 ||
+      req.newSessionToken ||
+      req.clearSessionToken ||
+      res.getHeaderNames().some((n) => !PAGE_HEADERS.has(n)) ||
+      epoch() !== req.epoch ||
+      pageEpoch !== req.epoch
+    )
+      return;
+    const session = [];
+    for (const k of Object.keys(req.session)) {
+      const v = rails.stringify(req.session[k]);
+      if (before.get(k) !== v) session.push([k, v]);
+    }
+    for (const k of before.keys())
+      if (!(k in req.session)) session.push([k, undefined]);
+    const headers = res.getHeaderNames().map((n) => [n, res.getHeader(n)]);
+    pageBytes += body.length + key.length;
+    pages.set(key, { body, headers, session, lastRoom: req.lastRoom });
+    for (const [k, v] of pages) {
+      if (pageBytes <= PAGE_LIMIT) break;
+      pages.delete(k);
+      pageBytes -= v.body.length + k.length;
+    }
+  };
+  next();
+}
 export function createApp() {
   initialize();
   const app = express();
@@ -159,7 +369,8 @@ export function createApp() {
     });
     next();
   });
-  app.use(compression());
+  app.set("etag", false);
+  app.use(encodingMiddleware());
   app.use(
     "/assets",
     express.static(path.resolve("assets/generated/public/assets"), {
@@ -210,8 +421,7 @@ export function createApp() {
   });
   app.use(sessionMiddleware);
   app.use((req, res, next) => {
-    if (get("SELECT id FROM bans WHERE ip_address=?", req.ip))
-      return res.sendStatus(403);
+    if (cachedBans.has(req.ip)) return res.sendStatus(403);
     if (
       req.authenticatedByBot &&
       !/^\/rooms\/\d+\/[^/]+\/messages(?:\/|$)/.test(req.path)
@@ -250,6 +460,7 @@ export function createApp() {
       return res.sendStatus(422);
     next();
   });
+  app.use(pageCache);
   app.post("/session", (req, res, next) =>
     allowLogin(req.ip)
       ? next()

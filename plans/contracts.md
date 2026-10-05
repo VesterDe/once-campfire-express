@@ -14,6 +14,7 @@ the compatibility contract. Raw evidence stays ignored in `tmp/`.
 | Storage and media | Actual 3840×2160 JPEG becomes 1200×675; real ffmpeg audio/video analysis and poppler PDF preview; Rails-issued signed transform accepted; direct upload checksum/range/owner/private-room checks and failed-media rollback. |
 | Benchmarks | Matched production images with identical ordered 40-room/40-page/13-search windows, zero timed request failures, every acknowledged write stored with rich text and FTS, and SQLite integrity checks. Two paced runs admit all 100 sockets and deliver all 30 messages to every connection. Raw output remains ignored. |
 | Jobs and bots | Actual queued HTTP delivery and persisted bot reply with FTS and recursive-webhook suppression; expired lease recovery, fencing, heartbeat renewal, bounded retries and dead state. |
+| Response cache | Hot GET pages are reused only while SQLite data_version and this connection's change count are unchanged; the key holds user, session CSRF secret, last room, URL, host, protocol and negotiation headers. Byte comparison against the uncached app and cross-process write invalidation were checked; no ETags are sent. |
 | Backup/restore | Actual SQLite/storage round trip with integrity check; archive traversal/link rejection. Stop writers for consistency with file lifecycle. |
 
 Verification is limited to the exercised workflows, not a claim of exhaustive Rails

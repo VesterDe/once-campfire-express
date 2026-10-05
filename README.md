@@ -52,6 +52,9 @@ connection in both runs.
   rebuilding previews as needed. Native-library media bytes can differ.
 - HTML whitespace and malformed-fragment repair can differ. Full byte parity is not claimed.
 - Direct-room autocomplete explicitly requests JSON, repairing the original fetch-header bug.
+- Responses carry no ETag, so no 304 replies; every original page had a fresh CSRF token anyway.
+- Room, message-page, sidebar and search pages are cached per worker until any database write;
+  a repeated page reuses its masked CSRF token, which stays valid for that session.
 - Backups require a maintenance window for consistent database and file snapshots. App and
   queue snapshots are separate; external job effects have at-least-once delivery.
 
