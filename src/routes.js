@@ -186,6 +186,54 @@ export function serializeMessage(m, req) {
     url: `${origin(req)}/rooms/${m.room_id}/messages/${m.id}`,
   };
 }
+// Group commit: posts without attachments that arrive while the write lock is being
+// acquired share one transaction (each in its own savepoint). Every response is
+// sent only after the shared COMMIT.
+const postQueue = [];
+let postFlushing = false;
+function queuePost(roomId, userId, body, clientId) {
+  return new Promise((resolve, reject) => {
+    postQueue.push({ roomId, userId, body, clientId, resolve, reject });
+    if (!postFlushing) {
+      postFlushing = true;
+      setImmediate(flushPosts);
+    }
+  });
+}
+async function flushPosts() {
+  try {
+    while (postQueue.length) {
+      let batch = null;
+      try {
+        await writeTransaction(() =>
+          stagedFiles(() =>
+            transaction(() => {
+              batch = postQueue.splice(0);
+              for (const p of batch)
+                try {
+                  p.message = createMessage(
+                    p.roomId,
+                    p.userId,
+                    p.body,
+                    p.clientId,
+                    true,
+                  );
+                } catch (error) {
+                  p.error = error;
+                }
+            }),
+          ),
+        );
+      } catch (error) {
+        for (const p of batch || postQueue.splice(0)) p.reject(error);
+        continue;
+      }
+      for (const p of batch) p.error ? p.reject(p.error) : p.resolve(p.message);
+    }
+  } finally {
+    postFlushing = false;
+  }
+}
 const turbo = (res, action, target, body = "") =>
   res
     .type("text/vnd.turbo-stream.html")
@@ -505,7 +553,14 @@ export function registerRoutes(app) {
       if (req.method === "POST") {
         if (isBot && !body && !item) return res.sendStatus(422);
         const blob = await prepareMessageAttachment({ ...req, user }, item);
-        try {
+        if (item === null)
+          message = await queuePost(
+            room.id,
+            user.id,
+            body,
+            value(req, "message", "client_message_id") || null,
+          );
+        else try {
           await writeTransaction(() =>
             stagedFiles(() =>
               transaction(() => {

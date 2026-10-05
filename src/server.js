@@ -1,7 +1,7 @@
 import cluster from "node:cluster";
 import http from "node:http";
 import { initialize } from "./db.js";
-import { createApp } from "./app.js";
+import { createApp, fastPath } from "./app.js";
 import { attachCable, deliver } from "./cable.js";
 import { startWorker, stopWorker } from "./jobs.js";
 let shuttingDown = false;
@@ -13,10 +13,6 @@ if (cluster.isPrimary) {
   await startWorker();
   if (workers > 1) {
     for (let i = 0; i < workers; i++) cluster.fork();
-    cluster.on("message", (worker, event) => {
-      if (event?.type === "cable")
-        for (const w of Object.values(cluster.workers)) w.send(event);
-    });
     cluster.on("exit", (worker, code, signal) => {
       if (!shuttingDown) {
         console.error(`HTTP worker exited (${code || signal}); restarting`);
@@ -26,7 +22,16 @@ if (cluster.isPrimary) {
   }
 }
 if (workers === 1 || cluster.isWorker) {
-  const server = http.createServer(createApp());
+  const app = createApp();
+  const server = http.createServer((req, res) => {
+    let done = false;
+    try {
+      done = fastPath(app, req, res);
+    } catch (error) {
+      console.error(error);
+    }
+    if (!done) app(req, res);
+  });
   attachCable(server);
   server.listen(
     Number(process.env.HTTP_PORT || 8080),

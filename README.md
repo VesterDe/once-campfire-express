@@ -52,6 +52,8 @@ connection in both runs.
   rebuilding previews as needed. Native-library media bytes can differ.
 - HTML whitespace and malformed-fragment repair can differ. Full byte parity is not claimed.
 - Direct-room autocomplete explicitly requests JSON, repairing the original fetch-header bug.
+- A session cookie re-sent for the same old cookie and same new session within one second is
+  reused, so its embedded expiry can be up to one second older than the response time.
 - Backups require a maintenance window for consistent database and file snapshots. App and
   queue snapshots are separate; external job effects have at-least-once delivery.
 
