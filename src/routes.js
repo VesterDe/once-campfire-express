@@ -1,6 +1,6 @@
 import { randomBytes } from "node:crypto";
 import bcrypt from "bcryptjs";
-import { all, get, run, transaction, now } from "./db.js";
+import { all, get, run, transaction, writeTransaction, now } from "./db.js";
 import {
   roomForUser,
   roomsForUser,
@@ -481,17 +481,19 @@ export function registerRoutes(app) {
         if (isBot && !body && !item) return res.sendStatus(422);
         const blob = await prepareMessageAttachment({ ...req, user }, item);
         try {
-          stagedFiles(() =>
-            transaction(() => {
-              message = createMessage(
-                room.id,
-                user.id,
-                body,
-                value(req, "message", "client_message_id") || null,
-                true,
-              );
-              attachMessage(message, item, blob);
-            }),
+          await writeTransaction(() =>
+            stagedFiles(() =>
+              transaction(() => {
+                message = createMessage(
+                  room.id,
+                  user.id,
+                  body,
+                  value(req, "message", "client_message_id") || null,
+                  true,
+                );
+                attachMessage(message, item, blob);
+              }),
+            ),
           );
         } catch (error) {
           cleanupPrepared(blob);
