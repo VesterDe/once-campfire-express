@@ -506,12 +506,21 @@ const SUPPORTED = brotli
     : ["gzip", "deflate", "identity"],
   PREFERRED = brotli ? ["br", "gzip"] : ["gzip"];
 const NO_TRANSFORM = /(?:^|,)\s*?no-transform\s*?(?:,|$)/i;
+// The answer depends only on the Accept-Encoding text, so it is kept per text.
+const gzipByHeader = new Map();
 function wantsGzip(req, res, length) {
   if (length < 1024 || req.method === "HEAD") return false;
-  if (!req.headers?.["accept-encoding"]) return false;
+  const ae = req.headers?.["accept-encoding"];
+  if (!ae) return false;
   const cc = res.getHeader("Cache-Control");
   if (cc && NO_TRANSFORM.test(String(cc))) return false;
-  return new Negotiator(req).encoding(SUPPORTED, PREFERRED) === "gzip";
+  let v = gzipByHeader.get(ae);
+  if (v === undefined) {
+    v = new Negotiator(req).encoding(SUPPORTED, PREFERRED) === "gzip";
+    if (gzipByHeader.size > 100) gzipByHeader.clear();
+    gzipByHeader.set(ae, v);
+  }
+  return v;
 }
 const GZ_HEAD = Buffer.from([0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3]);
 // Non-final stored deflate blocks; the stream before them is byte aligned.
@@ -684,7 +693,69 @@ function templateGzip(page, L) {
   }
   return g;
 }
+// What res.send does for a 200 Buffer body, without its helpers: used only
+// when the request has no conditional headers (so no 304) and is a GET.
+const HTML_TYPE = "text/html; charset=utf-8";
+function quick(req) {
+  const h = req.headers;
+  return (
+    req.method === "GET" &&
+    h["if-none-match"] === undefined &&
+    h["if-modified-since"] === undefined &&
+    !!req.app?.get?.("etag fn")
+  );
+}
+function finish(res, body, etag, gz) {
+  res.setHeader("Content-Type", HTML_TYPE);
+  if (gz) {
+    res.setHeader("Content-Encoding", "gzip");
+    const vary = res.getHeader("Vary");
+    if (vary === undefined) res.setHeader("Vary", "Accept-Encoding");
+    else res.vary("Accept-Encoding");
+  }
+  res.setHeader("ETag", etag);
+  res.setHeader("Content-Length", body.length);
+  res.end(body);
+}
+function emitQuick(req, res, page) {
+  const fixed = !page.n1 && !page.n2;
+  if (fixed) {
+    const body = (page.raw ||= Buffer.concat(page.items.map((p) => p.raw)));
+    const fn = req.app.get("etag fn");
+    if (!wantsGzip(req, res, body.length))
+      return finish(res, body, (page.etagraw ||= fn(body, "utf8")), false);
+    page.gz ||= zlib.gzipSync(body);
+    return finish(res, page.gz, (page.etaggz ||= fn(page.gz, "utf8")), true);
+  }
+  const csrf = escape(req.csrfToken || "");
+  const t1 = Buffer.from(csrf);
+  const length = page.len + page.n1 * t1.length + page.n2 * (t1.length + INPUT_HEAD.length + INPUT_TAIL.length);
+  if (wantsGzip(req, res, length)) {
+    if (page.tpl?.L !== t1.length)
+      page.tpl = templateGzip(page, t1.length) || { L: t1.length, z: null };
+    const g = page.tpl;
+    if (g.z) {
+      // The body CRC already names this exact body (with page id and length).
+      const crc = tokenCrc(g, t1);
+      const n = g.z.length,
+        body = Buffer.allocUnsafe(n + 8);
+      g.z.copy(body);
+      for (const at of g.anchors) t1.copy(body, at);
+      body.writeUInt32LE(crc >>> 0, n);
+      body.writeUInt32LE(length >>> 0, n + 4);
+      return finish(
+        res,
+        body,
+        `W/"${body.length.toString(16)}-${BOOT_TAG}${page.id.toString(36)}.${crc.toString(36)}.${zlib.crc32(t1).toString(36)}"`,
+        true,
+      );
+    }
+  }
+  return null;
+}
+const BOOT_TAG = BOOT.slice(0, 8);
 function emit(req, res, page) {
+  if (quick(req) && emitQuick(req, res, page) !== null) return;
   res.type("html");
   const fixed = !page.n1 && !page.n2;
   let t1, t2, csrf;
@@ -768,14 +839,32 @@ function emit(req, res, page) {
 // MessageRows/MessageOrigin are spliced in from the per-message cache. `key`
 // names what the route data depends on besides the user row, host, protocol,
 // Turbo-Frame and session last room; null turns the page cache off.
+// The route called cacheEpoch() just before, so a lookup only needs the epoch
+// to still be the current one; stores check it again with usable().
+const current = (ep) => ep !== -1 && ep != null && ep === currentEpoch;
+// The key holds the user id; the whole row is compared field by field on a hit
+// (cheaper than putting JSON.stringify(row) in the key on every request).
+function sameRow(a, b) {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  let n = 0;
+  for (const k in a) {
+    if (a[k] !== b[k]) return false;
+    n++;
+  }
+  for (const k in b) n--;
+  return n === 0;
+}
 export function sendPage(req, res, screen, ep, key, makeExtra) {
-  const ok = usable(ep);
+  const h = req.headers || {};
   const fullKey =
-    ok && key != null
-      ? `${screen}|${key}|${req.protocol}|${req.get?.("host")}|${!!req.get?.("Turbo-Frame")}|${req.session?.last_room_id || ""}|${req.user ? JSON.stringify(req.user) : ""}`
+    current(ep) && key != null
+      ? `${screen}|${key}|${req.protocol}|${h.host}|${!!h["turbo-frame"]}|${req.session?.last_room_id || ""}|${req.user ? req.user.id : ""}`
       : null;
   let page = fullKey && pageCache.get(fullKey);
+  if (page && !sameRow(page.user, req.user || null)) page = null;
   if (!page) {
+    const ok = usable(ep);
     const {
       MessageRows: rows,
       MessageOrigin: origin = "",
@@ -792,16 +881,17 @@ export function sendPage(req, res, screen, ep, key, makeExtra) {
     if (rows && layout.split(MESSAGES_MARK).length !== 2)
       throw new Error(`${screen} page must print its messages exactly once`);
     page = buildPage(layout, entries, true);
+    page.user = req.user || null;
     if (fullKey && usable(ep)) storePage(fullKey, page);
   }
   return emit(req, res, page);
 }
 // The bare messages list (pagination). Returns false when there are no rows.
 export function sendMessages(req, res, ep, key, makeRows) {
-  const ok = usable(ep),
-    fullKey = ok && key != null ? "messages|" + key : null;
+  const fullKey = current(ep) && key != null ? "messages|" + key : null;
   let page = fullKey && pageCache.get(fullKey);
   if (!page) {
+    const ok = usable(ep);
     const rows = makeRows();
     if (!rows.length) return false;
     page = buildPage(null, messageEntries(rows, "", ok), false);
