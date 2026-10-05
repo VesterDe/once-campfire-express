@@ -282,202 +282,40 @@ function wrap(req, res, method, next) {
     next();
   }
 }
-// Whole-response cache for the hot authenticated GET pages. Entries are valid
-// only while epoch() is unchanged (no write in any process), and the key holds
-// everything the page reads from the request. A hit replays the handler's
-// session changes and headers, so cookies are written exactly as on a miss.
-const PAGE_LIMIT = 32 * 1024 * 1024;
-const PAGE_HEADERS = new Set([
-  "x-content-type-options",
-  "x-frame-options",
-  "referrer-policy",
-  "content-type",
-  "content-length",
-  "content-encoding",
-  "vary",
-]);
-const pages = new Map();
-let pageBytes = 0,
-  pageEpoch = null;
-const pageKey = (url, user, session, protocol, h) =>
-  [
-    url,
-    user.id,
-    session._csrf_token,
-    session.last_room_id ?? "",
-    protocol,
-    h.host ?? "",
-    h["turbo-frame"] ?? "",
-    h.accept ?? "",
-    h["accept-encoding"] ?? "",
-  ].join("\n");
-// Raw node:http path for page-cache hits. It only answers when every Express
-// layer would be a no-op or act exactly as replayed here (plain HTTP, no
-// trusted proxy, GET without body, valid session, fresh activity, not banned,
-// cached page). Otherwise it returns false before any side effect and the
-// request goes through Express unchanged.
-const cookieSerialize = createRequire(
-  createRequire(import.meta.url).resolve("express"),
-)("cookie").serialize;
-// Same as Express res.cookie() for string values.
-function expressCookie(name, value, options) {
-  const opts = { ...options };
-  if (opts.maxAge != null) {
-    const maxAge = opts.maxAge - 0;
-    if (!isNaN(maxAge)) {
-      opts.expires = new Date(Date.now() + maxAge);
-      opts.maxAge = Math.floor(maxAge / 1000);
-    }
-  }
-  if (opts.path == null) opts.path = "/";
-  return cookieSerialize(name, String(value), opts);
-}
-export function fastPath(req, res) {
-  if (req.method !== "GET" || process.env.TRUSTED_PROXIES) return false;
+// Lean router for the hot GET pages. It is the app's own router stack minus
+// the layers marked skip(), which are no-ops for a GET without a body whose
+// path matches HOT_PATH and carries no .json/.turbo_stream suffix (asset
+// static, format suffix rewrite, body parsers, multipart, method override).
+// Session, bans, CSRF, routes, 404 and error handling run unchanged.
+const Router = createRequire(createRequire(import.meta.url).resolve("express"))(
+  "router",
+);
+const skip = (fn) => ((fn.skipOnFastPath = true), fn);
+const FORMAT_SUFFIX = /\.(json|turbo_stream)(?=\?|$)/;
+const fastApps = new WeakMap();
+export function fastPath(app, req, res) {
+  if (req.method !== "GET") return false;
   const h = req.headers;
-  if (
-    h["content-length"] !== undefined ||
-    h["transfer-encoding"] !== undefined ||
-    req.socket.encrypted
-  )
+  if (h["content-length"] !== undefined || h["transfer-encoding"] !== undefined)
     return false;
   const url = req.url,
     q = url.indexOf("?");
-  if (!HOT_PATH.test(q < 0 ? url : url.slice(0, q))) return false;
-  const coding = contentCoding(h["accept-encoding"]);
-  if (coding === "br" || coding === "deflate") return false;
-  const cookies = parseCookies(h.cookie);
-  let session;
-  try {
-    session = rails.decryptCookieCached(
-      "_campfire_session",
-      cookies._campfire_session,
-    );
-    if (
-      !session ||
-      typeof session !== "object" ||
-      Array.isArray(session) ||
-      !session.session_id ||
-      rails.decode64(session._csrf_token).length !== 32
-    )
-      return false;
-  } catch {
+  if (!HOT_PATH.test(q < 0 ? url : url.slice(0, q)) || FORMAT_SUFFIX.test(url))
     return false;
+  let lean = fastApps.get(app);
+  if (!lean) {
+    const router = new Router({
+      caseSensitive: app.enabled("case sensitive routing"),
+      strict: app.enabled("strict routing"),
+    });
+    router.params = app.router.params;
+    router.stack = app.router.stack.filter((l) => !l.handle.skipOnFastPath);
+    lean = Object.create(app, { router: { value: router } });
+    fastApps.set(app, lean);
   }
-  const e = epoch();
-  if (e < 0) return false;
-  refreshCaches(e);
-  if (pageEpoch !== e || cachedBans.has(req.socket.remoteAddress)) return false;
-  const [current, user] = sessionAndUser(cookies);
-  if (
-    !user ||
-    !(
-      new Date(current.last_active_at.replace(" ", "T") + "Z").getTime() >=
-      Date.now() - 3600000
-    )
-  )
-    return false;
-  const hit = pages.get(pageKey(url, user, session, "http", h));
-  if (hit === undefined) return false;
-  const before = rails.stringify(session);
-  for (const [k, v] of hit.session)
-    if (v === undefined) delete session[k];
-    else session[k] = rails.parseJSON(v);
-  // Same cookies, options and order as the sessionMiddleware writeHead hook.
-  const options = {
-    httpOnly: true,
-    sameSite: "lax",
-    secure: false,
-    maxAge: 20 * 365 * 86400 * 1000,
-    path: "/",
-  };
-  const expiry = new Date(Date.now() + options.maxAge);
-  const setCookie = [];
-  if (rails.stringify(session) !== before)
-    setCookie.push(
-      expressCookie(
-        "_campfire_session",
-        rails.encryptCookie("_campfire_session", session, expiry),
-        options,
-      ),
-    );
-  if (hit.lastRoom !== undefined)
-    setCookie.push(
-      expressCookie("last_room", String(hit.lastRoom), {
-        ...options,
-        httpOnly: false,
-      }),
-    );
-  res.statusCode = 200;
-  for (const [k, v] of hit.headers) res.setHeader(k, v);
-  if (setCookie.length)
-    res.setHeader(
-      "Set-Cookie",
-      setCookie.length === 1 ? setCookie[0] : setCookie,
-    );
-  res.end(hit.body);
+  req.body = undefined;
+  lean.handle(req, res);
   return true;
-}
-function pageCache(req, res, next) {
-  if (
-    req.method !== "GET" ||
-    !req.user ||
-    req.authenticatedByBot ||
-    req.format ||
-    req.epoch < 0 ||
-    !HOT_PATH.test(req.path)
-  )
-    return next();
-  if (pageEpoch !== req.epoch) {
-    pages.clear();
-    pageBytes = 0;
-    pageEpoch = req.epoch;
-  }
-  const h = req.headers;
-  const key = pageKey(req.originalUrl, req.user, req.session, req.protocol, h);
-  const hit = pages.get(key);
-  if (hit !== undefined) {
-    for (const [k, v] of hit.session)
-      if (v === undefined) delete req.session[k];
-      else req.session[k] = rails.parseJSON(v);
-    if (hit.lastRoom !== undefined) req.lastRoom = hit.lastRoom;
-    res.statusCode = 200;
-    for (const [k, v] of hit.headers) res.setHeader(k, v);
-    res.pageCapture = null;
-    res.end(hit.body);
-    return;
-  }
-  const before = new Map(
-    Object.keys(req.session).map((k) => [k, rails.stringify(req.session[k])]),
-  );
-  res.pageCapture = (body) => {
-    res.pageCapture = null;
-    if (
-      res.statusCode !== 200 ||
-      req.newSessionToken ||
-      req.clearSessionToken ||
-      res.getHeaderNames().some((n) => !PAGE_HEADERS.has(n)) ||
-      epoch() !== req.epoch ||
-      pageEpoch !== req.epoch
-    )
-      return;
-    const session = [];
-    for (const k of Object.keys(req.session)) {
-      const v = rails.stringify(req.session[k]);
-      if (before.get(k) !== v) session.push([k, v]);
-    }
-    for (const k of before.keys())
-      if (!(k in req.session)) session.push([k, undefined]);
-    const headers = res.getHeaderNames().map((n) => [n, res.getHeader(n)]);
-    pageBytes += body.length + key.length;
-    pages.set(key, { body, headers, session, lastRoom: req.lastRoom });
-    for (const [k, v] of pages) {
-      if (pageBytes <= PAGE_LIMIT) break;
-      pages.delete(k);
-      pageBytes -= v.body.length + k.length;
-    }
-  };
-  next();
 }
 export function createApp() {
   initialize();
@@ -494,56 +332,63 @@ export function createApp() {
     });
     next();
   });
-  app.set("etag", false);
   app.use(encodingMiddleware());
   app.use(
     "/assets",
-    express.static(path.resolve("assets/generated/public/assets"), {
-      immutable: true,
-      maxAge: "1y",
-      dotfiles: "deny",
+    skip(
+      express.static(path.resolve("assets/generated/public/assets"), {
+        immutable: true,
+        maxAge: "1y",
+        dotfiles: "deny",
+      }),
+    ),
+  );
+  app.use(
+    skip((req, res, next) => {
+      if (
+        !req.path.startsWith("/rails/active_storage/") &&
+        !req.path.startsWith("/webmanifest")
+      )
+        req.url = req.url.replace(
+          /\.(json|turbo_stream)(?=\?|$)/,
+          (m, format) => {
+            req.format = format;
+            return "";
+          },
+        );
+      next();
     }),
   );
-  app.use((req, res, next) => {
-    if (
-      !req.path.startsWith("/rails/active_storage/") &&
-      !req.path.startsWith("/webmanifest")
-    )
-      req.url = req.url.replace(
-        /\.(json|turbo_stream)(?=\?|$)/,
-        (m, format) => {
-          req.format = format;
-          return "";
-        },
-      );
-    next();
-  });
   app.use(
     "/rails/active_storage/disk",
-    express.raw({ type: () => true, limit: "100mb" }),
+    skip(express.raw({ type: () => true, limit: "100mb" })),
   );
-  app.use(express.json({ limit: "5mb" }));
-  app.use(express.urlencoded({ extended: true, limit: "5mb" }));
-  app.use((req, res, next) => {
-    if (req.is("multipart/form-data"))
-      multer({
-        storage: multer.memoryStorage(),
-        limits: { fileSize: 100 * 1024 * 1024, files: 20, fields: 1000 },
-      }).any()(req, res, next);
-    else next();
-  });
-  app.use(express.text({ type: "text/plain", limit: "5mb" }));
-  app.use(multipartFields);
-  app.use((req, res, next) => {
-    if (
-      req.method === "POST" &&
-      ["PATCH", "PUT", "DELETE"].includes(
-        String(req.body?._method || "").toUpperCase(),
+  app.use(skip(express.json({ limit: "5mb" })));
+  app.use(skip(express.urlencoded({ extended: true, limit: "5mb" })));
+  app.use(
+    skip((req, res, next) => {
+      if (req.is("multipart/form-data"))
+        multer({
+          storage: multer.memoryStorage(),
+          limits: { fileSize: 100 * 1024 * 1024, files: 20, fields: 1000 },
+        }).any()(req, res, next);
+      else next();
+    }),
+  );
+  app.use(skip(express.text({ type: "text/plain", limit: "5mb" })));
+  app.use(skip(multipartFields));
+  app.use(
+    skip((req, res, next) => {
+      if (
+        req.method === "POST" &&
+        ["PATCH", "PUT", "DELETE"].includes(
+          String(req.body?._method || "").toUpperCase(),
+        )
       )
-    )
-      req.method = req.body._method.toUpperCase();
-    next();
-  });
+        req.method = req.body._method.toUpperCase();
+      next();
+    }),
+  );
   app.use(sessionMiddleware);
   app.use((req, res, next) => {
     if (cachedBans.has(req.ip)) return res.sendStatus(403);
@@ -585,7 +430,6 @@ export function createApp() {
       return res.sendStatus(422);
     next();
   });
-  app.use(pageCache);
   app.post("/session", (req, res, next) =>
     allowLogin(req.ip)
       ? next()

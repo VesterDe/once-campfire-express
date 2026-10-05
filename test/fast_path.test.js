@@ -14,6 +14,7 @@ const domain = await import("../src/domain.js");
 const rails = await import("../src/rails.js");
 const { createApp, fastPath } = await import("../src/app.js");
 let server, base, room, users, lastId;
+const TOKEN = /(?<=authenticity_token" value="|csrf-token" content=")[^"]*/g;
 before(async () => {
   initialize();
   const t = now();
@@ -53,7 +54,7 @@ before(async () => {
   // Same composition as src/server.js: fast path first, then Express.
   const app = createApp();
   server = createServer((req, res) => {
-    if (!fastPath(req, res)) app(req, res);
+    if (!fastPath(app, req, res)) app(req, res);
   });
   await new Promise((resolve) => server.listen(0, "127.0.0.1", resolve));
   base = `http://127.0.0.1:${server.address().port}`;
@@ -96,7 +97,7 @@ function get(path, headers) {
       .then(async (r) => {
         const raw = Buffer.from(await r.arrayBuffer());
         const headers = [...r.headers].filter(
-          ([k]) => !["date", "set-cookie"].includes(k),
+          ([k]) => !["date", "set-cookie", "etag"].includes(k),
         );
         const cookies = r.headers.getSetCookie().map((c) => {
           const [nv, ...attrs] = c.split("; ");
@@ -109,12 +110,17 @@ function get(path, headers) {
             attrs.filter((a) => !a.startsWith("Expires=")),
           ];
         });
-        resolve({ status: r.status, headers, cookies, body: raw.toString() });
+        resolve({
+          status: r.status,
+          headers,
+          cookies,
+          body: raw.toString().replace(TOKEN, "TOKEN"),
+        });
       })
       .catch(reject),
   );
 }
-test("cached hot pages repeat the uncached response, per user, until any write", async () => {
+test("lean fast-path router repeats responses per user and sees writes from other connections", async () => {
   const one = await login("u0@example.test"),
     two = await login("u1@example.test");
   for (const path of [

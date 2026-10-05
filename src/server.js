@@ -13,10 +13,6 @@ if (cluster.isPrimary) {
   await startWorker();
   if (workers > 1) {
     for (let i = 0; i < workers; i++) cluster.fork();
-    cluster.on("message", (worker, event) => {
-      if (event?.type === "cable")
-        for (const w of Object.values(cluster.workers)) w.send(event);
-    });
     cluster.on("exit", (worker, code, signal) => {
       if (!shuttingDown) {
         console.error(`HTTP worker exited (${code || signal}); restarting`);
@@ -30,7 +26,7 @@ if (workers === 1 || cluster.isWorker) {
   const server = http.createServer((req, res) => {
     let done = false;
     try {
-      done = fastPath(req, res);
+      done = fastPath(app, req, res);
     } catch (error) {
       console.error(error);
     }
