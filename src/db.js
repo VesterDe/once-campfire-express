@@ -1,4 +1,5 @@
 import { DatabaseSync } from "node:sqlite";
+import cluster from "node:cluster";
 import { mkdirSync, readFileSync } from "node:fs";
 import { dirname, resolve, join } from "node:path";
 let connection,
@@ -32,26 +33,54 @@ export function initialize(
     );
   }
   validateSchema(connection);
-  connection.exec("PRAGMA journal_mode=WAL;");
+  // Rails' SQLite adapter defaults: synchronous=NORMAL, mmap 128MB, journal limit 64MB.
+  connection.exec(
+    "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA journal_size_limit=67108864; PRAGMA mmap_size=134217728;",
+  );
+  // HTTP workers never checkpoint inside a request; the primary does it on a timer.
+  if (cluster.isWorker) connection.exec("PRAGMA wal_autocheckpoint=0;");
+  else if (Number(process.env.WEB_WORKERS || "1") > 1)
+    setInterval(() => {
+      try {
+        connection.exec("PRAGMA wal_checkpoint(PASSIVE);");
+      } catch {}
+    }, 1000).unref();
   return connection;
+}
+const statements = new Map();
+export function stmt(sql) {
+  let s = statements.get(sql);
+  if (!s) statements.set(sql, (s = db().prepare(sql)));
+  return s;
+}
+// Process-local caches call epoch() and drop their entries when it changes.
+// data_version moves on commits from other connections; total_changes on ours.
+let epochValue = 0,
+  lastVersion = -1,
+  lastChanges = -1;
+export function epoch() {
+  if (depth) return -1;
+  const v = stmt(
+    "SELECT (SELECT data_version FROM pragma_data_version) AS v, total_changes() AS c",
+  ).get();
+  if (v.v !== lastVersion || v.c !== lastChanges) {
+    lastVersion = v.v;
+    lastChanges = v.c;
+    epochValue++;
+  }
+  return epochValue;
 }
 export function db() {
   return connection || initialize();
 }
 export function all(sql, ...params) {
-  return db()
-    .prepare(sql)
-    .all(...params);
+  return stmt(sql).all(...params);
 }
 export function get(sql, ...params) {
-  return db()
-    .prepare(sql)
-    .get(...params);
+  return stmt(sql).get(...params);
 }
 export function run(sql, ...params) {
-  return db()
-    .prepare(sql)
-    .run(...params);
+  return stmt(sql).run(...params);
 }
 export function now() {
   return new Date(process.env.CAMPFIRE_FROZEN_TIME || Date.now())
@@ -60,10 +89,60 @@ export function now() {
     .replace("Z", "")
     .replace(/(\.\d{3})$/, "$1000");
 }
+// SQLite's busy handler sleeps 1-10ms per retry while holding the whole process.
+// Take the write lock with short, growing waits instead (20µs to 1ms, 10s overall).
+const pause = new Int32Array(new SharedArrayBuffer(4));
+const busy = (error) => (error?.errcode & 0xff) === 5;
+function begin() {
+  const c = db();
+  c.exec("PRAGMA busy_timeout=0");
+  try {
+    let deadline = 0;
+    for (let wait = 0.02; ; wait = Math.min(wait * 1.5, 1)) {
+      try {
+        c.exec("BEGIN IMMEDIATE");
+        return;
+      } catch (error) {
+        if (!busy(error)) throw error;
+        deadline ||= Date.now() + 10000;
+        if (Date.now() > deadline) throw error;
+      }
+      Atomics.wait(pause, 0, 0, wait);
+    }
+  } finally {
+    c.exec("PRAGMA busy_timeout=10000");
+  }
+}
+// Like transaction(), but while another process holds the write lock this process
+// keeps serving other work: it retries BEGIN IMMEDIATE from the event loop.
+let begun = false;
+export async function writeTransaction(fn) {
+  if (depth) return transaction(fn);
+  const c = db();
+  let deadline = 0;
+  for (;;) {
+    c.exec("PRAGMA busy_timeout=0");
+    try {
+      c.exec("BEGIN IMMEDIATE");
+      begun = true;
+      break;
+    } catch (error) {
+      if (!busy(error)) throw error;
+      deadline ||= Date.now() + 10000;
+      if (Date.now() > deadline) throw error;
+    } finally {
+      c.exec("PRAGMA busy_timeout=10000");
+    }
+    await new Promise((resolve) => setImmediate(resolve));
+  }
+  return transaction(fn);
+}
 export function transaction(fn) {
   const name = `nested_${depth}`,
     nested = depth > 0;
-  db().exec(nested ? `SAVEPOINT ${name}` : "BEGIN IMMEDIATE");
+  if (nested) db().exec(`SAVEPOINT ${name}`);
+  else if (begun) begun = false;
+  else begin();
   depth++;
   callbacks.push([]);
   let result, hooks;
