@@ -24,6 +24,11 @@ import {
   fragment,
   messageData,
   roomData,
+  directMembers,
+  cacheEpoch,
+  sendPage,
+  sendMessages,
+  signStream,
   userData,
   avatar,
   iso,
@@ -341,26 +346,33 @@ export function registerRoutes(app) {
     login,
     (req, res) => {
       if (!/^\d+$/.test(req.params.roomId)) return res.sendStatus(404);
+      const ep = cacheEpoch();
       const room = roomForUser(req.user, req.params.roomId);
       if (!room) return res.redirect("/");
       req.lastRoom = room.id;
       req.session.last_room_id = room.id;
-      const membership = get(
-        "SELECT involvement FROM memberships WHERE room_id=? AND user_id=?",
-        room.id,
-        req.user.id,
+      sendPage(
+        req,
+        res,
+        "room",
+        ep,
+        room.id + "|" + (req.params.messageId ?? ""),
+        () => ({
+          Room: roomData(room, req.user),
+          MessageRows: messagesForRoom(room.id, {
+            around: req.params.messageId,
+          }),
+          MessageOrigin: origin(req),
+          LoadedAt: epoch(room.updated_at),
+          Stream: signStream(rails.stream(room)),
+          Involvement: get(
+            "SELECT involvement FROM memberships WHERE room_id=? AND user_id=?",
+            room.id,
+            req.user.id,
+          ).involvement,
+          Invitation: false,
+        }),
       );
-      send(req, res, "room", {
-        Room: roomData(room, req.user),
-        Messages: messageData(
-          messagesForRoom(room.id, { around: req.params.messageId }),
-          origin(req),
-        ),
-        LoadedAt: epoch(room.updated_at),
-        Stream: rails.signStream(rails.stream(room)),
-        Involvement: membership.involvement,
-        Invitation: false,
-      });
     },
   );
   app.delete("/rooms/:roomId", login, (req, res) => {
@@ -370,24 +382,29 @@ export function registerRoutes(app) {
     res.redirect("/");
   });
   app.get(["/users/me/sidebar", "/users/:id/sidebar"], login, (req, res) => {
-    const rooms = roomsForUser(req.user.id).filter(
-      (r) => r.involvement !== "invisible",
-    );
-    rooms.sort((a, b) =>
-      a.type === "Rooms::Direct" && b.type === "Rooms::Direct"
-        ? b.updated_at.localeCompare(a.updated_at)
-        : a.type === "Rooms::Direct"
-          ? -1
-          : b.type === "Rooms::Direct"
-            ? 1
-            : (a.name || "").localeCompare(b.name || ""),
-    );
-    send(req, res, "sidebar", {
-      SidebarRooms: rooms.map((r) => ({
-        ...roomData(r, req.user),
-        Unread: !!r.unread_at,
-      })),
-      Placeholders: [],
+    sendPage(req, res, "sidebar", cacheEpoch(), "", () => {
+      const rooms = roomsForUser(req.user.id).filter(
+        (r) => r.involvement !== "invisible",
+      );
+      rooms.sort((a, b) =>
+        a.type === "Rooms::Direct" && b.type === "Rooms::Direct"
+          ? b.updated_at.localeCompare(a.updated_at)
+          : a.type === "Rooms::Direct"
+            ? -1
+            : b.type === "Rooms::Direct"
+              ? 1
+              : (a.name || "").localeCompare(b.name || ""),
+      );
+      const members = directMembers(
+        rooms.filter((r) => r.type === "Rooms::Direct").map((r) => r.id),
+      );
+      return {
+        SidebarRooms: rooms.map((r) => ({
+          ...roomData(r, req.user, members),
+          Unread: !!r.unread_at,
+        })),
+        Placeholders: [],
+      };
     });
   });
   app.all(
@@ -429,6 +446,16 @@ export function registerRoutes(app) {
               )?.body || "",
           });
         }
+        if (!json && !message) {
+          const { before, after, around } = req.query;
+          return sendMessages(
+            req,
+            res,
+            cacheEpoch(),
+            room.id + "|" + JSON.stringify([before, after, around]),
+            () => messagesForRoom(room.id, req.query),
+          ) || res.sendStatus(204);
+        }
         const rows = message ? [message] : messagesForRoom(room.id, req.query);
         if (!rows.length) return res.sendStatus(204);
         if (json) {
@@ -462,11 +489,9 @@ export function registerRoutes(app) {
               : rows.map((m) => serializeMessage(m, req)),
           );
         }
-        return message
-          ? send(req, res, "show-message", { Messages: messageData(rows) })
-          : res
-              .type("html")
-              .send(fragment("messages", { Messages: messageData(rows) }));
+        return sendPage(req, res, "show-message", cacheEpoch(), null, () => ({
+          MessageRows: rows,
+        }));
       }
       if (message && !can(user, message)) return res.sendStatus(403);
       const item = attachment(req),
@@ -1266,27 +1291,29 @@ function registerSearch(app) {
       }
       return res.redirect("/searches?" + new URLSearchParams({ q: query }));
     }
-    let rows = [];
-    if (query) {
-      const ids = all(
-        "SELECT m.id FROM messages m JOIN message_search_index idx ON idx.rowid=m.id JOIN memberships ms ON ms.room_id=m.room_id WHERE ms.user_id=? AND idx.body MATCH ? ORDER BY m.created_at DESC LIMIT 100",
-        req.user.id,
-        query
-          .split(/\s+/)
-          .map((word) => '"' + word.replaceAll('"', '""') + '"')
-          .join(" "),
-      ).map((r) => r.id);
-      rows = messagesByIds(ids).sort((a, b) =>
-        a.created_at.localeCompare(b.created_at),
-      );
-    }
-    send(req, res, "search", {
-      Messages: messageData(rows),
-      Query: query,
-      RecentSearches: all(
-        "SELECT query FROM searches WHERE user_id=? ORDER BY updated_at DESC LIMIT 10",
-        req.user.id,
-      ).map((s) => s.query),
+    sendPage(req, res, "search", cacheEpoch(), query, () => {
+      let rows = [];
+      if (query) {
+        const ids = all(
+          "SELECT m.id FROM messages m JOIN message_search_index idx ON idx.rowid=m.id JOIN memberships ms ON ms.room_id=m.room_id WHERE ms.user_id=? AND idx.body MATCH ? ORDER BY m.created_at DESC LIMIT 100",
+          req.user.id,
+          query
+            .split(/\s+/)
+            .map((word) => '"' + word.replaceAll('"', '""') + '"')
+            .join(" "),
+        ).map((r) => r.id);
+        rows = messagesByIds(ids).sort((a, b) =>
+          a.created_at.localeCompare(b.created_at),
+        );
+      }
+      return {
+        MessageRows: rows,
+        Query: query,
+        RecentSearches: all(
+          "SELECT query FROM searches WHERE user_id=? ORDER BY updated_at DESC LIMIT 10",
+          req.user.id,
+        ).map((s) => s.query),
+      };
     });
   });
 }
