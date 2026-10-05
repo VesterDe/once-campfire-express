@@ -25,7 +25,7 @@ export const roomForUser = (user, id) =>
     Number(id),
   );
 const presentation =
-  "SELECT m.*,u.name AS creator_name,u.bio AS creator_bio,u.updated_at AS creator_updated_at,r.name AS room_name,r.type AS room_type FROM messages m JOIN users u ON u.id=m.creator_id JOIN rooms r ON r.id=m.room_id";
+  "SELECT m.*,u.name AS creator_name,u.bio AS creator_bio,u.updated_at AS creator_updated_at,r.name AS room_name,r.type AS room_type,(SELECT updated_at FROM action_text_rich_texts WHERE record_type='Message' AND record_id=m.id AND name='body') AS body_updated_at,(SELECT max(blob_id) FROM active_storage_attachments WHERE record_type='Message' AND record_id=m.id AND name='attachment') AS attachment_blob_id FROM messages m JOIN users u ON u.id=m.creator_id JOIN rooms r ON r.id=m.room_id";
 export const messageById = (id) =>
   get(presentation + " WHERE m.id=?", Number(id));
 export function messagesForRoom(id, { before, after, around } = {}) {
