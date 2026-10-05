@@ -6,6 +6,7 @@ import {
   roomsForUser,
   userById,
   messageById,
+  messagesByIds,
   messagesForRoom,
   grantMemberships,
   createUser,
@@ -16,6 +17,7 @@ import {
   indexMessage,
   publishMessage,
   notifyMessage,
+  announceMessage,
 } from "./domain.js";
 import {
   render,
@@ -486,6 +488,7 @@ export function registerRoutes(app) {
                 user.id,
                 body,
                 value(req, "message", "client_message_id") || null,
+                true,
               );
               attachMessage(message, item, blob);
             }),
@@ -494,8 +497,10 @@ export function registerRoutes(app) {
           cleanupPrepared(blob);
           throw error;
         }
-        publishMessage(message);
-        notifyMessage(message);
+        // Without an attachment the row read inside createMessage is still current.
+        const shown = item === null ? message : messageById(message.id),
+          html = fragment("message", messageData([shown])[0]);
+        announceMessage(message, html, room);
         if (isBot)
           return res
             .status(201)
@@ -505,14 +510,12 @@ export function registerRoutes(app) {
             )
             .end();
         if (json)
-          return res
-            .status(201)
-            .json(serializeMessage(messageById(message.id), req));
+          return res.status(201).json(serializeMessage(shown, req));
         return turbo(
           res,
           "append",
           `messages_rooms_${room.type.split("::").pop().toLowerCase()}_${room.id}`,
-          fragment("message", messageData([messageById(message.id)])[0]),
+          html,
         );
       }
       if (["PATCH", "PUT"].includes(req.method)) {
@@ -1271,9 +1274,9 @@ function registerSearch(app) {
           .map((word) => '"' + word.replaceAll('"', '""') + '"')
           .join(" "),
       ).map((r) => r.id);
-      rows = ids
-        .map(messageById)
-        .sort((a, b) => a.created_at.localeCompare(b.created_at));
+      rows = messagesByIds(ids).sort((a, b) =>
+        a.created_at.localeCompare(b.created_at),
+      );
     }
     send(req, res, "search", {
       Messages: messageData(rows),
