@@ -43,12 +43,25 @@ export function authenticateCookies(header) {
 const SESSION_USER_SQL =
   "SELECT s.id AS __s_id,s.created_at AS __s_created_at,s.ip_address AS __s_ip_address,s.last_active_at AS __s_last_active_at,s.token AS __s_token,s.updated_at AS __s_updated_at,s.user_agent AS __s_user_agent,s.user_id AS __s_user_id,u.* FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.token=? AND u.status=0";
 function sessionAndUser(cookies) {
+  let token;
+  try {
+    token = rails.verifyCookieCached("session_token", cookies.session_token);
+  } catch {
+    return [null, null];
+  }
+  if (typeof token !== "string") return lookupSession(token);
+  let hit = sessionUsers.get(token);
+  if (hit === undefined) {
+    hit = lookupSession(token);
+    if (sessionUsers.size >= 10000) sessionUsers.clear();
+    sessionUsers.set(token, hit);
+  }
+  return hit[0] ? [{ ...hit[0] }, { ...hit[1] }] : [null, null];
+}
+function lookupSession(token) {
   let row;
   try {
-    row = get(
-      SESSION_USER_SQL,
-      rails.verifyCookieCached("session_token", cookies.session_token),
-    );
+    row = get(SESSION_USER_SQL, token);
   } catch {
     return [null, null];
   }
@@ -67,8 +80,10 @@ function sessionAndUser(cookies) {
 let cachedEpoch = null,
   cachedAccount,
   cachedBans;
+const sessionUsers = new Map();
 function refreshCaches(e) {
   if (e !== cachedEpoch || e < 0) {
+    sessionUsers.clear();
     cachedAccount = get("SELECT * FROM accounts ORDER BY id LIMIT 1");
     cachedBans = new Set(
       all("SELECT ip_address FROM bans").map((r) => r.ip_address),
@@ -97,6 +112,7 @@ function sessionMiddleware(req, res, next) {
   req.session.session_id ||= randomBytes(16).toString("hex");
   req.session._csrf_token ||= rails.b64(randomBytes(32));
   req.csrfToken = rails.maskCsrf(rails.decode64(req.session._csrf_token));
+  refreshCaches((req.epoch = epoch()));
   [req.currentSession, req.user] = sessionAndUser(req.cookies);
   req.authenticatedByBot = false;
   if (!req.user) {
@@ -122,7 +138,7 @@ function sessionMiddleware(req, res, next) {
       req.currentSession.last_active_at.replace(" ", "T") + "Z",
     ).getTime() <
       Date.now() - 3600000
-  )
+  ) {
     run(
       "UPDATE sessions SET last_active_at=?,updated_at=?,user_agent=?,ip_address=? WHERE id=?",
       now(),
@@ -131,8 +147,8 @@ function sessionMiddleware(req, res, next) {
       req.ip,
       req.currentSession.id,
     );
-  req.epoch = epoch();
-  refreshCaches(req.epoch);
+    refreshCaches((req.epoch = epoch()));
+  }
   req.account = cachedAccount && { ...cachedAccount };
   const writeHead = res.writeHead;
   res.writeHead = function (...args) {
