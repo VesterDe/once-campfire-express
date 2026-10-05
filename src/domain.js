@@ -10,7 +10,7 @@ import {
 import { publish } from "./cable.js";
 import { stream } from "./rails.js";
 import { fragment, messageData } from "./rendering.js";
-import { enqueue } from "./jobs.js";
+import { enqueue, enqueueMany } from "./jobs.js";
 export const userById = (id) =>
   get("SELECT * FROM users WHERE id=?", Number(id));
 export const roomsForUser = (id) =>
@@ -28,6 +28,19 @@ const presentation =
   "SELECT m.*,u.name AS creator_name,u.bio AS creator_bio,u.updated_at AS creator_updated_at,r.name AS room_name,r.type AS room_type,(SELECT updated_at FROM action_text_rich_texts WHERE record_type='Message' AND record_id=m.id AND name='body') AS body_updated_at,(SELECT max(blob_id) FROM active_storage_attachments WHERE record_type='Message' AND record_id=m.id AND name='attachment') AS attachment_blob_id FROM messages m JOIN users u ON u.id=m.creator_id JOIN rooms r ON r.id=m.room_id";
 export const messageById = (id) =>
   get(presentation + " WHERE m.id=?", Number(id));
+// Rows for the given ids, in the same order as ids (one query instead of N).
+export function messagesByIds(ids) {
+  if (!ids.length) return [];
+  const byId = new Map();
+  for (const row of all(
+    presentation + " WHERE m.id IN (SELECT value FROM json_each(?))",
+    JSON.stringify(ids.map(Number)),
+  ))
+    byId.set(row.id, row);
+  return ids.map((id) => byId.get(Number(id)));
+}
+// Sanitized body of messages created in this process, so notifyMessage skips a re-read.
+const createdContent = new WeakMap();
 export function messagesForRoom(id, { before, after, around } = {}) {
   if (around) {
     const pivot = get(
@@ -126,9 +139,16 @@ export function indexMessage(id, body, filename = "") {
     plainText(body) || filename,
   );
 }
-export function createMessage(roomId, userId, body = "", clientId = null) {
+export function createMessage(
+  roomId,
+  userId,
+  body = "",
+  clientId = null,
+  memberChecked = false,
+) {
   return transaction(() => {
     if (
+      !memberChecked &&
       !get(
         "SELECT id FROM memberships WHERE room_id=? AND user_id=?",
         Number(roomId),
@@ -149,22 +169,23 @@ export function createMessage(roomId, userId, body = "", clientId = null) {
       time,
     );
     const id = Number(result.lastInsertRowid);
-    run(
-      "INSERT INTO action_text_rich_texts(name,record_type,record_id,body,created_at,updated_at) VALUES('body','Message',?,?,?,?)",
-      id,
-      content,
-      time,
-      time,
-    );
-    reconcileEmbeds(
-      get(
-        "SELECT id FROM action_text_rich_texts WHERE record_type='Message' AND record_id=?",
+    const richId = Number(
+      run(
+        "INSERT INTO action_text_rich_texts(name,record_type,record_id,body,created_at,updated_at) VALUES('body','Message',?,?,?,?)",
         id,
-      ).id,
-      content,
-      Number(userId),
+        content,
+        time,
+        time,
+      ).lastInsertRowid,
     );
-    indexMessage(id, content);
+    // New AUTOINCREMENT ids: no old embeds or search row can exist for them.
+    if (content.includes("<action-text-attachment"))
+      reconcileEmbeds(richId, content, Number(userId));
+    run(
+      "INSERT INTO message_search_index(rowid,body) VALUES(?,?)",
+      id,
+      plainText(content) || "",
+    );
     run("UPDATE rooms SET updated_at=? WHERE id=?", time, Number(roomId));
     const cutoff = new Date(Date.now() - 60000)
       .toISOString()
@@ -178,7 +199,9 @@ export function createMessage(roomId, userId, body = "", clientId = null) {
       Number(userId),
       cutoff,
     );
-    return messageById(id);
+    const message = messageById(id);
+    createdContent.set(message, content);
+    return message;
   });
 }
 export function updateMessage(
@@ -261,8 +284,15 @@ export function deleteMessage(message, { broadcast = true } = {}) {
     if (broadcast) publishMessage(message, "remove");
   });
 }
-export function publishMessage(message, action = "append") {
-  const room = get("SELECT * FROM rooms WHERE id=?", message.room_id);
+export function publishMessage(
+  message,
+  action = "append",
+  rendered = null,
+  knownRoom = null,
+  members = null,
+) {
+  const room =
+    knownRoom || get("SELECT * FROM rooms WHERE id=?", message.room_id);
   if (!room) return;
   const target =
     action === "append"
@@ -271,47 +301,72 @@ export function publishMessage(message, action = "append") {
   const html =
     action === "remove"
       ? ""
-      : fragment("message", messageData([messageById(message.id)])[0]);
+      : (rendered ??
+        fragment("message", messageData([messageById(message.id)])[0]));
   publish(
     stream(room),
     `<turbo-stream action="${action}" target="${target}" maintain_scroll="true"><template>${html}</template></turbo-stream>`,
   );
   if (action === "append")
-    for (const m of all(
-      "SELECT user_id FROM memberships WHERE room_id=?",
-      room.id,
-    ))
+    for (const m of members ||
+      all("SELECT user_id FROM memberships WHERE room_id=?", room.id))
       publish(`user_${m.user_id}_unreads`, { roomId: room.id });
 }
-export function notifyMessage(message, { webhooks = true } = {}) {
+// All memberships of a room with user role/status (null when the user row is missing).
+export const roomMembers = (roomId) =>
+  all(
+    "SELECT m.*,u.role,u.status FROM memberships m LEFT JOIN users u ON u.id=m.user_id WHERE m.room_id=?",
+    Number(roomId),
+  );
+// Publish a newly created message with pre-rendered html, then notify, sharing one memberships read.
+export function announceMessage(message, html, room) {
+  const members = roomMembers(room.id);
+  publishMessage(message, "append", html, room, members);
+  notifyMessage(message, {}, room, members);
+}
+export function notifyMessage(
+  message,
+  { webhooks = true } = {},
+  knownRoom = null,
+  members = null,
+) {
+  const content = createdContent.get(message);
   const body =
-      get(
-        "SELECT body FROM action_text_rich_texts WHERE record_type='Message' AND record_id=?",
-        message.id,
-      )?.body || "",
-    mentions = mentionIds(body),
-    room = get("SELECT * FROM rooms WHERE id=?", message.room_id);
-  for (const m of all(
-    "SELECT m.*,u.role,u.status FROM memberships m JOIN users u ON u.id=m.user_id WHERE m.room_id=? AND m.user_id<>?",
-    message.room_id,
-    message.creator_id,
-  )) {
-    if (m.status !== 0) continue;
+      content !== undefined
+        ? content || ""
+        : get(
+            "SELECT body FROM action_text_rich_texts WHERE record_type='Message' AND record_id=?",
+            message.id,
+          )?.body || "",
+    // Mentions are always <action-text-attachment> tags; skip the parse otherwise.
+    mentions = body.includes("<action-text-attachment")
+      ? mentionIds(body)
+      : new Set(),
+    room = knownRoom || get("SELECT * FROM rooms WHERE id=?", message.room_id);
+  const jobs = [];
+  for (const m of members ||
+    all(
+      "SELECT m.*,u.role,u.status FROM memberships m JOIN users u ON u.id=m.user_id WHERE m.room_id=? AND m.user_id<>?",
+      message.room_id,
+      message.creator_id,
+    )) {
+    if (m.user_id === message.creator_id || m.status !== 0) continue;
     if (
       webhooks &&
       m.role === 2 &&
       (room.type === "Rooms::Direct" || mentions.has(m.user_id))
     )
       for (const w of all("SELECT id FROM webhooks WHERE user_id=?", m.user_id))
-        enqueue("webhook", { webhook_id: w.id, message_id: message.id });
+        jobs.push(["webhook", { webhook_id: w.id, message_id: message.id }]);
     if (
       (!m.connected_at ||
         Date.now() - Date.parse(m.connected_at + "Z") > 60000) &&
       (m.involvement === "everything" ||
         (m.involvement === "mentions" && mentions.has(m.user_id)))
     )
-      enqueue("push", { user_id: m.user_id, message_id: message.id });
+      jobs.push(["push", { user_id: m.user_id, message_id: message.id }]);
   }
+  enqueueMany(jobs);
 }
 export function deleteRoom(room) {
   for (const message of all("SELECT * FROM messages WHERE room_id=?", room.id))
