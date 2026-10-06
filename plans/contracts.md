@@ -51,3 +51,31 @@ middleware and Express would make; brotli, deflate, identity and HEAD still
 go through the normal middleware. Verified by decoding with Node zlib, Ruby
 `Zlib::GzipReader` and `curl --compressed` against the uncached code on a
 seeded database before and after boosts, edits, renames and posts.
+
+Raw repeat path (`fastPath` in `src/app.js`): when a hot GET (room, messages
+page, sidebar, search) is answered from the page cache through the normal
+path, the app records the response headers and the derived request state. A
+later GET with the same URL, client address and byte-identical raw header
+list is answered with one `writeHead` + `end`, without Express, while all of
+these still hold: same `epoch()`, same page cache entry, session activity
+newer than one hour (no `last_active_at` write due), cookie expiries in the
+future, unchanged secret, and, when a session cookie is set (room pages set
+`last_room_id`), the memoized encrypted cookie is still valid (under one
+second old, the same 1 s staleness the normal path allows). The CSRF mask,
+`ETag`, `Content-Length` and cookie `Expires` are made fresh per request.
+New sessions, bot keys, conditional requests, non-gzip token pages and any
+other case use the normal path. `test/raw_fast.test.js` compares status,
+header order and values (except `Date`, the CSRF-dependent `ETag` part and
+the `Expires` second) and decoded bodies of both paths.
+
+`epoch()` first reads the 96-byte WAL-index header at the start of the
+`-shm` file. Every commit by any connection (this one included) and every WAL
+restart rewrites that header (change counter, frame count, salts, checksums;
+copy 1 is written before copy 0). If both copies are equal and identical to
+the header read before the last SQL check, no commit can have happened since,
+and the SQL (`data_version`, `total_changes()`) is skipped. Otherwise, or in a
+non-WAL database or with `EPOCH_SHM=0`, the SQL runs as before.
+`test/epoch_shm.test.js` checks that commits from both connections and WAL
+restarts move the epoch. Limit: this relies on SQLite's documented WAL-index
+layout and on `read()` of the `-shm` file seeing the shared mapping (true on
+Linux and macOS, which share one page cache for both).
