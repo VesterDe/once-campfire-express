@@ -170,7 +170,11 @@ export function createMessage(
   memberChecked = false,
   defer = null,
 ) {
-  return transaction(() => {
+  // defer.bare: the caller's transaction is the only boundary (group commit
+  // retries the batch with one savepoint per post if anything throws).
+  // defer.content / defer.plain: sanitized body and its search text, computed
+  // by the HTTP worker before it hands the post to the writer.
+  const create = () => {
     if (
       !memberChecked &&
       !get(
@@ -183,7 +187,7 @@ export function createMessage(
         status: 403,
       });
     const time = now(),
-      content = sanitize(body);
+      content = defer?.content ?? sanitize(body);
     const result = run(
       "INSERT INTO messages(room_id,creator_id,client_message_id,created_at,updated_at) VALUES(?,?,?,?,?)",
       Number(roomId),
@@ -208,7 +212,7 @@ export function createMessage(
     run(
       "INSERT INTO message_search_index(rowid,body) VALUES(?,?)",
       id,
-      plainText(content) || "",
+      (defer?.content != null ? defer.plain : plainText(content)) || "",
     );
     const cutoff = new Date(Date.now() - 60000)
       .toISOString()
@@ -231,7 +235,8 @@ export function createMessage(
     const message = messageById(id);
     createdContent.set(message, content);
     return message;
-  });
+  };
+  return defer?.bare ? create() : transaction(create);
 }
 export function updateMessage(
   message,
