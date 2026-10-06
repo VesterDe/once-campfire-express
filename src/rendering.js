@@ -190,14 +190,14 @@ export function messageData(messages, origin = "") {
       HTML: safe('<div class="lexxy-content">' + body + "</div>"),
       AllEmoji: !!text && !/[\p{L}\p{N}]/u.test(text),
       Boosts: (boostsByMessage.get(m.id) || []).map((b) => ({
-          ID: b.id,
-          MessageID: b.message_id,
-          BoosterID: b.booster_id,
-          Booster: b.name,
-          BoosterTitle: b.name,
-          BoosterUpdatedAt: b.booster_updated_at,
-          Content: b.content,
-        })),
+        ID: b.id,
+        MessageID: b.message_id,
+        BoosterID: b.booster_id,
+        Booster: b.name,
+        BoosterTitle: b.name,
+        BoosterUpdatedAt: b.booster_updated_at,
+        Content: b.content,
+      })),
       Attachment: blob ? { Filename: blob.filename } : null,
       DownloadURL: url ? url + "?disposition=attachment" : "",
       BlobURL: url,
@@ -483,7 +483,7 @@ const BOOT = randomUUID();
 function setETag(req, res, page, kind, body, tokenText, length) {
   const fn = req.app?.get?.("etag fn");
   if (!fn) return;
-  if (body) return res.set("ETag", page["etag" + kind] ||= fn(body, "utf8"));
+  if (body) return res.set("ETag", (page["etag" + kind] ||= fn(body, "utf8")));
   const hash = createHash("sha1")
     .update(`${BOOT}|${page.id}|${kind}|${tokenText}`)
     .digest("base64")
@@ -555,7 +555,10 @@ const WINDOW_GAP = 30000;
 const GZ_LEVEL = +process.env.PAGE_GZ_LEVEL || 6,
   GZ_MEM = +process.env.PAGE_GZ_MEM || 8;
 function placeholder(L) {
-  const sym = [0xc0, 0xc1, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9, 0xfa, 0xfb, 0xfc, 0xfd, 0xfe, 0xff];
+  const sym = [
+    0xc0, 0xc1, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9, 0xfa, 0xfb, 0xfc, 0xfd, 0xfe,
+    0xff,
+  ];
   const k = sym.length,
     seq = [],
     a = new Array(k * 2).fill(0);
@@ -619,8 +622,9 @@ function templateGzip(page, L) {
   let pos = 0;
   const put = (b) => (parts.push(b), (pos += b.length));
   for (const it of page.items)
-    if (it === 1) tokens.push(pos), put(P);
-    else if (it === 2) put(INPUT_HEAD), tokens.push(pos), put(P), put(INPUT_TAIL);
+    if (it === 1) (tokens.push(pos), put(P));
+    else if (it === 2)
+      (put(INPUT_HEAD), tokens.push(pos), put(P), put(INPUT_TAIL));
     else put(it.raw);
   const tpl = Buffer.concat(parts, pos);
   const out = [GZ_HEAD],
@@ -630,7 +634,9 @@ function templateGzip(page, L) {
     prevEnd = -Infinity;
   const deflate = (end, finish) => {
     const options = {
-      finishFlush: finish ? zlib.constants.Z_FINISH : zlib.constants.Z_SYNC_FLUSH,
+      finishFlush: finish
+        ? zlib.constants.Z_FINISH
+        : zlib.constants.Z_SYNC_FLUSH,
       level: GZ_LEVEL,
       memLevel: GZ_MEM,
     };
@@ -664,7 +670,10 @@ function templateGzip(page, L) {
     return v;
   };
   for (const at of tokens) {
-    S = prev < 0 ? 0x80000000 : (multmodp(shiftGap(at - prev), S) ^ 0x80000000) >>> 0;
+    S =
+      prev < 0
+        ? 0x80000000
+        : (multmodp(shiftGap(at - prev), S) ^ 0x80000000) >>> 0;
     prev = at;
   }
   if (prev >= 0) S = multmodp(shiftGap(pos - prev - L), S);
@@ -780,14 +789,30 @@ function emitQuick(req, res, page) {
   const e = req.app.get("etag");
   if (e !== "weak" && e !== true) return null;
   const cc = res.getHeader("Cache-Control");
-  const r = respond(
-    page,
-    req.csrfToken,
+  const gzipOk =
     !(cc && NO_TRANSFORM.test(String(cc))) &&
-      gzipFor(req.headers["accept-encoding"]),
-  );
+    gzipFor(req.headers["accept-encoding"]);
+  const r = respond(page, req.csrfToken, gzipOk);
   if (!r) return null;
+  const rec = req.fastRecord;
+  if (rec) {
+    rec.page = page;
+    rec.gzipOk = gzipOk;
+  }
   return finish(res, r.body, r.etag, r.gz);
+}
+// Raw fast path (src/app.js): true while `page` is still the cache entry for
+// `key` at epoch `ep`, i.e. what sendPage/sendMessages would serve.
+export function pageCurrent(key, page, ep) {
+  return currentEpoch === ep && pageCache.get(key) === page;
+}
+// Body and ETag exactly as emitQuick() sends them, for a fresh CSRF mask.
+export function fastPageBody(page, rawCsrf, gzipOk) {
+  return respond(
+    page,
+    !page.n1 && !page.n2 ? undefined : rails.maskCsrf(rawCsrf),
+    gzipOk,
+  );
 }
 // For a front server that skips Express: the cached page for this request, as
 // writeHead() header pairs plus body, or null on a miss (then run the route).
@@ -967,6 +992,7 @@ export function sendPage(req, res, screen, ep, key, makeExtra) {
     page.user = req.user || null;
     if (fullKey && usable(ep)) storePage(fullKey, page);
   }
+  if (req.fastRecord) req.fastRecord.key = fullKey;
   return emit(req, res, page);
 }
 // The bare messages list (pagination). Returns false when there are no rows.
@@ -980,6 +1006,7 @@ export function sendMessages(req, res, ep, key, makeRows) {
     page = buildPage(null, messageEntries(rows, "", ok), false);
     if (fullKey && usable(ep)) storePage(fullKey, page);
   }
+  if (req.fastRecord) req.fastRecord.key = fullKey;
   emit(req, res, page);
   return true;
 }

@@ -155,12 +155,12 @@ export function finish(job, error = null, at = Date.now() / 1000) {
   return prepared(
     "UPDATE jobs SET lease_until=NULL,lease_token=NULL,available_at=?,status=?,last_error=? WHERE id=? AND lease_token=?",
   ).run(
-      at + Math.min(300, 2 ** job.attempts),
-      job.attempts >= 5 ? "dead" : "ready",
-      String(error).slice(0, 1000),
-      job.id,
-      job.lease_token,
-    ).changes;
+    at + Math.min(300, 2 ** job.attempts),
+    job.attempts >= 5 ? "dead" : "ready",
+    String(error).slice(0, 1000),
+    job.id,
+    job.lease_token,
+  ).changes;
 }
 export async function perform(kind, data) {
   if (kind === "purge") {
@@ -372,7 +372,9 @@ export async function workOnce() {
   if (!job) return false;
   const heartbeat = setInterval(() => {
     try {
-      prepared("UPDATE jobs SET lease_until=? WHERE id=? AND lease_token=?").run(Date.now() / 1000 + 120, job.id, job.lease_token);
+      prepared(
+        "UPDATE jobs SET lease_until=? WHERE id=? AND lease_token=?",
+      ).run(Date.now() / 1000 + 120, job.id, job.lease_token);
     } catch (error) {
       console.error("Campfire lease renewal failed:", error.message);
     }
