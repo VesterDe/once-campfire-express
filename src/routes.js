@@ -11,6 +11,8 @@ import {
   grantMemberships,
   createUser,
   createMessage,
+  applyUnread,
+  createdBody,
   updateMessage,
   deleteMessage,
   deleteRoom,
@@ -217,10 +219,12 @@ async function flushPosts() {
                     p.body,
                     p.clientId,
                     true,
+                    p,
                   );
                 } catch (error) {
                   p.error = error;
                 }
+              applyUnread(batch.filter((p) => !p.error).map((p) => p.unread));
             }),
           ),
         );
@@ -581,7 +585,14 @@ export function registerRoutes(app) {
         }
         // Without an attachment the row read inside createMessage is still current.
         const shown = item === null ? message : messageById(message.id),
-          html = fragment("message", messageData([shown])[0]);
+          html = fragment(
+            "message",
+            messageData(
+              [shown],
+              "",
+              item === null ? (createdBody(shown) ?? null) : null,
+            )[0],
+          );
         announceMessage(message, html, room);
         if (isBot)
           return res

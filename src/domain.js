@@ -131,6 +131,29 @@ export function createUser({
     return user;
   });
 }
+// Runs the deferred room/membership updates of a group commit, in post order.
+export function applyUnread(list) {
+  const rooms = new Map(),
+    members = new Map();
+  for (const u of list) {
+    rooms.delete(u[0]);
+    rooms.set(u[0], u);
+    const k = u[0] + "|" + u[1];
+    members.delete(k);
+    members.set(k, u);
+  }
+  for (const [roomId, , time] of rooms.values())
+    run("UPDATE rooms SET updated_at=? WHERE id=?", time, roomId);
+  for (const [roomId, userId, time, cutoff] of members.values())
+    run(
+      "UPDATE memberships SET unread_at=?,updated_at=? WHERE room_id=? AND user_id<>? AND involvement<>'invisible' AND (connected_at IS NULL OR connected_at<?)",
+      time,
+      time,
+      roomId,
+      userId,
+      cutoff,
+    );
+}
 export function indexMessage(id, body, filename = "") {
   run("DELETE FROM message_search_index WHERE rowid=?", Number(id));
   run(
@@ -145,6 +168,7 @@ export function createMessage(
   body = "",
   clientId = null,
   memberChecked = false,
+  defer = null,
 ) {
   return transaction(() => {
     if (
@@ -186,11 +210,15 @@ export function createMessage(
       id,
       plainText(content) || "",
     );
-    run("UPDATE rooms SET updated_at=? WHERE id=?", time, Number(roomId));
     const cutoff = new Date(Date.now() - 60000)
       .toISOString()
       .replace("T", " ")
       .replace("Z", "");
+    // A group commit runs these once per room / (room, creator) at the end:
+    // the last post's statements write the same rows an earlier post's would.
+    if (defer) defer.unread = [Number(roomId), Number(userId), time, cutoff];
+    else {
+    run("UPDATE rooms SET updated_at=? WHERE id=?", time, Number(roomId));
     run(
       "UPDATE memberships SET unread_at=?,updated_at=? WHERE room_id=? AND user_id<>? AND involvement<>'invisible' AND (connected_at IS NULL OR connected_at<?)",
       time,
@@ -199,6 +227,7 @@ export function createMessage(
       Number(userId),
       cutoff,
     );
+    }
     const message = messageById(id);
     createdContent.set(message, content);
     return message;
@@ -319,6 +348,7 @@ export const roomMembers = (roomId) =>
     Number(roomId),
   );
 // Publish a newly created message with pre-rendered html, then notify, sharing one memberships read.
+export const createdBody = (message) => createdContent.get(message);
 export function announceMessage(message, html, room) {
   const members = roomMembers(room.id);
   publishMessage(message, "append", html, room, members);
