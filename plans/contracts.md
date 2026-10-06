@@ -78,9 +78,22 @@ headers, no `Upgrade`, no `Expect`, `Connection` only as `keep-alive`) is
 looked up with the same raw repeat match and the same validity checks; a hit
 is written as one Buffer that is byte-identical to what node:http writes for
 the raw repeat path (headers, then `Date`, `Connection: keep-alive`,
-`Keep-Alive: timeout=N`, then body). Several hits pipelined in one TCP read
-share one `epoch()` read (same synchronous run, nothing else can commit in
-between). A front-eligible GET that is not a hit is served on the same
+`Keep-Alive: timeout=N`, then body). Hits share one `epoch()` read per
+event-loop turn (`turnEpoch()` in `src/db.js`): the value is reused until the
+next check phase (`setImmediate`) and only while this process ran no SQL since
+the read (`stmt()`, `transaction()` and `writeTransaction()` bump a counter that
+drops the shared value). Deliberate limit: a request read from the kernel in
+the same poll phase, but after another process's commit that came after the
+read, is checked against the epoch from before that commit. A client that waits
+for a write's response before sending its next request cannot hit this: its
+socket had no unread bytes when that poll phase's ready list was taken, so it
+is read in a later turn. Only a client that pipelines a GET behind an earlier
+unanswered request on the same socket, while a write on another connection
+finishes, can see the older page. Hits use the socket's stream handle directly
+(`process.binding("stream_wrap")`: `handle.onread` for reads,
+`handle.writeBuffer` for the response; `NETFRONT_DIRECT=0` uses `'data'` and
+`socket.write`), and a read that is byte-equal to the last single complete
+head on that socket reuses its parsed form without parsing. A front-eligible GET that is not a hit is served on the same
 socket: the front builds node's own `IncomingMessage` (method, URL, raw
 headers, HTTP/1.1, no body) and `ServerResponse` (keep-alive, server
 keep-alive timeout), emits the http server's `request` event, and reads the
