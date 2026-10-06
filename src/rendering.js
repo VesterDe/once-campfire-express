@@ -489,7 +489,7 @@ function shiftTable(n) {
   return t;
 }
 function crcOf(p) {
-  if (p.crc === -1) {
+  if (p.shift == null) {
     p.crc = zlib.crc32(p.raw);
     p.shift = shiftTable(p.raw.length);
   }
