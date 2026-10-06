@@ -54,6 +54,11 @@ connection in both runs.
 - Direct-room autocomplete explicitly requests JSON, repairing the original fetch-header bug.
 - A session cookie re-sent for the same old cookie and same new session within one second is
   reused, so its embedded expiry can be up to one second older than the response time.
+- A byte-identical repeat of a hot GET (same URL, client address and raw headers) answered by
+  the raw repeat path reuses the body built earlier in the same clock second, so its CSRF
+  mask (and the ETag) is the same for every such repeat in that second. Rails masks the token
+  again on every request. The masked token is still valid for that session; only the
+  per-request BREACH re-masking is weaker within that second.
 - Backups require a maintenance window for consistent database and file snapshots. App and
   queue snapshots are separate; external job effects have at-least-once delivery.
 
