@@ -61,7 +61,10 @@ pieces (the page text between CSRF tokens and the message list) are kept by
 their exact text with their deflate stream and CRC-32. The gzip trailer CRC is
 made with zlib's crc32_combine arithmetic from the per-piece CRCs, so a request
 does not pass over the whole page. None of these is a stored response: the
-page is still joined per request with a fresh CSRF mask.
+page is still joined per request with a fresh CSRF mask. A joined page with a
+token gets the ETag `W/"<length>-<boot id><page id><kind>.<CRC-32 of the
+token>"` (no SHA-1 per request); it still changes whenever the body does,
+except for a 1 in 2^32 chance between two tokens on the same page.
 
 Raw repeat path (`fastPath` in `src/app.js`): when a hot GET (room, messages
 page, sidebar, search) is answered from the page cache through the normal
