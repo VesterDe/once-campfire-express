@@ -71,6 +71,10 @@ connection in both runs.
   that is pipelined behind an unanswered request on the same connection can, in rare
   timing, get the page from just before another process's write; a client that waits
   for each response (browsers, the benchmark) always sees the write.
+- The answer to posting a message (`POST /rooms/:id/messages`) is sent without gzip, also
+  when the client accepts gzip (identity is always an acceptable coding). Rails gzips it.
+  The body and all other headers are the same; gzip of the ~8 KB turbo stream cost more
+  server CPU than it saved.
 - Backups require a maintenance window for consistent database and file snapshots. App and
   queue snapshots are separate; external job effects have at-least-once delivery.
 
