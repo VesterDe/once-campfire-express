@@ -591,9 +591,31 @@ function buildPage(layout, entries, tokens) {
     if (it === 1) n1++;
     else if (it === 2) n2++;
     else len += it.raw.length;
-  return { id: ++pageSeq, items, len, n1, n2 };
+  return { id: ++pageSeq, items, len, n1, n2, key: entries };
 }
 let pageSeq = 0;
+// SHA-1 ETags of token-less gzip bodies, per kept entries list. A hit needs
+// the same ETag function and the very same deflate buffers in the same order,
+// so the body bytes, and so the hash, are the same.
+const etagMemo = new WeakMap();
+function memoETag(req, res, page, list, count, size, body) {
+  const fn = req.app?.get?.("etag fn");
+  if (!fn) return;
+  const hit = page.key && etagMemo.get(page.key);
+  if (hit && hit.fn === fn && hit.size === size && hit.zs.length === count) {
+    let same = true;
+    for (let j = 0; j < count; j++)
+      if (hit.zs[j] !== list[j + 1]) {
+        same = false;
+        break;
+      }
+    if (same) return res.set("ETag", hit.etag);
+  }
+  const etag = fn(body, "utf8");
+  if (page.key)
+    etagMemo.set(page.key, { fn, size, zs: list.slice(1, count + 1), etag });
+  res.set("ETag", etag);
+}
 const BOOT = randomUUID();
 const ETAG_BOOT = BOOT.slice(0, 8);
 // Express would hash the whole body for its ETag. A page without a CSRF
@@ -710,7 +732,7 @@ function emit(req, res, page) {
   tail.writeUInt32LE(length >>> 0, 6);
   list[i] = tail;
   const body = Buffer.concat(list, size);
-  if (fixed) setETag(req, res, page, "gz", body);
+  if (fixed) memoETag(req, res, page, list, i - 1, size, body);
   else setETag(req, res, page, "gz", null, csrf, size);
   return res.send(body);
 }

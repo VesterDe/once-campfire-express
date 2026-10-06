@@ -181,3 +181,41 @@ test("lean fast-path router repeats responses per user and sees writes from othe
   banning.close();
   assert.equal((await get(`/rooms/${room}`, { cookie: one })).status, 200);
 });
+// The kept ETag of a token-less gzip page is the SHA-1 of the bytes sent,
+// on a repeat and after a write from another connection.
+test("token-less gzip page ETag matches its body across repeats and writes", async () => {
+  const one = await login("u0@example.test");
+  const { request } = await import("node:http");
+  const { createHash } = await import("node:crypto");
+  const path = `/rooms/${room}/messages?before=${lastId}`;
+  const raw = () =>
+    new Promise((resolve, reject) =>
+      request(
+        base + path,
+        { headers: { cookie: one, "accept-encoding": "gzip" } },
+        (m) => {
+          const chunks = [];
+          m.on("data", (c) => chunks.push(c));
+          m.on("end", () =>
+            resolve({ etag: m.headers.etag, body: Buffer.concat(chunks) }),
+          );
+        },
+      )
+        .on("error", reject)
+        .end(),
+    );
+  const expected = (b) =>
+    `W/"${b.length.toString(16)}-${createHash("sha1").update(b).digest("base64").slice(0, 27)}"`;
+  const a = await raw(),
+    b = await raw();
+  assert.equal(a.etag, expected(a.body));
+  assert.equal(b.etag, a.etag);
+  assert.deepEqual(b.body, a.body);
+  const outside = new DatabaseSync(join(temp, "db/production.sqlite3"));
+  outside.exec(`UPDATE users SET name='Etag Renamed' WHERE id=${users[1].id}`);
+  outside.close();
+  const c = await raw();
+  assert.ok(gunzipSync(c.body).toString().includes("Etag Renamed"));
+  assert.notEqual(c.etag, a.etag);
+  assert.equal(c.etag, expected(c.body));
+});

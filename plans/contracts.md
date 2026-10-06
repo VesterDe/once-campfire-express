@@ -71,6 +71,12 @@ page is still joined per request with a fresh CSRF mask. A joined page with a
 token gets the ETag `W/"<length>-<boot id><page id><kind>.<CRC-32 of the
 token>"` (no SHA-1 per request); it still changes whenever the body does,
 except for a 1 in 2^32 chance between two tokens on the same page.
+A page without a token (the messages list) keeps the Express SHA-1 ETag of
+its gzip body. That ETag is kept with the cached entries list together with
+the deflate buffers it was made from; it is used again only when the same
+function gets the very same buffers in the same order (so the same bytes).
+A new epoch gives new rows, new entries and a new hash. The value is the
+same as before; only the SHA-1 pass per request is gone.
 
 Sidebar room list (`sidebarState` in `src/routes.js`): the HTML of one user's
 room list (direct and shared rooms, from `sidebarRooms` in
