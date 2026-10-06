@@ -9,7 +9,7 @@ the compatibility contract. Raw evidence stays ignored in `tmp/`.
 | Rails signing, encryption and CSRF | Independent Rails vectors verify PBKDF2 keys, signed/encrypted cookies, signed IDs including large integers, SGIDs, application verifiers, Turbo streams, session continuity, purpose/expiry/signature rejection and 189 CSRF cases. Bounded data-only Marshal fixtures come from Ruby. |
 | SQLite and messages | Real isolated databases test nested rollback, membership authorization, raw timestamp cursors, persisted writes, updates/deletion and FTS; independent HTTP checks compare actual stored records. |
 | Frontend | Independent browser checks cover live compose/edit/delete/boost, mentions, paging, search, private/direct rooms, image upload/lightbox, administration and fresh setup. |
-| Sessions | Independent original Rails server accepts Express-issued cookies and Express accepts Rails-issued cookies on shared disposable data. |
+| Sessions | Independent original Rails server accepts Express-issued cookies and Express accepts Rails-issued cookies on shared disposable data. An identical session update from the same incoming cookie reuses the value encrypted under one second earlier (embedded expiry lags by under one second). |
 | Action Cable | Real sockets verify native subscription delivery, forged stream rejection, membership revocation, logout revocation and multi-tab presence. Cross-worker production browser delivery is exercised. |
 | Storage and media | Actual 3840×2160 JPEG becomes 1200×675; real ffmpeg audio/video analysis and poppler PDF preview; Rails-issued signed transform accepted; direct upload checksum/range/owner/private-room checks and failed-media rollback. |
 | Benchmarks | Matched production images with identical ordered 40-room/40-page/13-search windows, zero timed request failures, every acknowledged write stored with rich text and FTS, and SQLite integrity checks. Two paced runs admit all 100 sockets and deliver all 30 messages to every connection. Raw output remains ignored. |
@@ -34,3 +34,20 @@ higher tail latency than Rails; the table reports the median, not a capacity lim
 The unchanged common load generator and original seed hashes are recorded in ignored
 scratch evidence. Benchmark orchestration is Ruby, and server processes share four
 hardware threads; Express uses three HTTP workers and its primary job/fanout process.
+
+## Page and message HTML caches
+
+Room, messages-page, sidebar, search and single-message pages are cached per
+process (`src/rendering.js`): one entry per message (key: message id + origin,
+checked against the presentation row) and one entry per page (key: route
+inputs, full user row, host, protocol, Turbo-Frame, session last room). All
+entries are dropped when `epoch()` in `src/db.js` moves, which happens on any
+commit from any process. The decoded HTML is byte-identical to an uncached
+render except for the random CSRF token. Deliberate differences: gzip bytes
+are made by the app (one stored gzip for pages without a token; for pages with
+a token, a prebuilt stream whose token bytes are patched per request), so the
+compressed bytes and the `ETag` values differ from what the compression
+middleware and Express would make; brotli, deflate, identity and HEAD still
+go through the normal middleware. Verified by decoding with Node zlib, Ruby
+`Zlib::GzipReader` and `curl --compressed` against the uncached code on a
+seeded database before and after boosts, edits, renames and posts.
