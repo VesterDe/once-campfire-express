@@ -52,6 +52,14 @@ go through the normal middleware. Verified by decoding with Node zlib, Ruby
 `Zlib::GzipReader` and `curl --compressed` against the uncached code on a
 seeded database before and after boosts, edits, renames and posts.
 
+Search data cache (`registerSearch` in `src/routes.js`): the result rows and
+the recent-search list for one (user id, cleaned query) are kept per process
+under the `epoch()` read before the queries, at most 256 entries, and dropped
+when `epoch()` moves. It holds database rows only; the page is still rendered
+per request (also on not-crazy-perf, which has no page cache). Rows are not
+changed after they are read. GET `/searches` writes nothing, as in Rails (only
+POST records a search), so repeat searches stay warm until some write.
+
 Raw repeat path (`fastPath` in `src/app.js`): when a hot GET (room, messages
 page, sidebar, search) is answered from the page cache through the normal
 path, the app records the response headers and the derived request state. A
