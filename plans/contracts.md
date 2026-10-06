@@ -62,7 +62,10 @@ newer than one hour (no `last_active_at` write due), cookie expiries in the
 future, unchanged secret, and, when a session cookie is set (room pages set
 `last_room_id`), the memoized encrypted cookie is still valid (under one
 second old, the same 1 s staleness the normal path allows). The CSRF mask,
-`ETag`, `Content-Length` and cookie `Expires` are made fresh per request.
+`ETag`, `Content-Length` and cookie `Expires` are made fresh once per entry
+per clock second: repeats in the same second reuse the built body and header
+list (deliberate difference: Rails re-masks per request; the reused masked
+token still unmasks to the session's CSRF secret).
 New sessions, bot keys, conditional requests, non-gzip token pages and any
 other case use the normal path. `test/raw_fast.test.js` compares status,
 header order and values (except `Date`, the CSRF-dependent `ETag` part and

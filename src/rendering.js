@@ -618,8 +618,10 @@ function x2nmodp(n, k) {
 }
 // x^(8*bytes) mod P: moves a CRC term `bytes` bytes further from the end.
 const shiftBytes = (bytes) => x2nmodp(bytes, 3);
+let crcScratch = Buffer.alloc(128);
 function tokenCrc(g, token) {
-  const d = Buffer.allocUnsafe(token.length);
+  if (crcScratch.length < token.length) crcScratch = Buffer.alloc(token.length);
+  const d = crcScratch.subarray(0, token.length);
   for (let i = 0; i < d.length; i++) d[i] = token[i] ^ g.P[i];
   return (g.crc ^ multmodp(g.S, (zlib.crc32(d) ^ g.zeroCrc) >>> 0)) >>> 0;
 }
@@ -783,7 +785,7 @@ function respond(page, csrfToken, gzipOk) {
   if (!g.z) return null;
   const crc = tokenCrc(g, t1);
   const n = g.z.length,
-    body = Buffer.allocUnsafe(n + 8);
+    body = slabBuffer(n + 8);
   g.z.copy(body);
   for (const at of g.anchors) t1.copy(body, at);
   body.writeUInt32LE(crc >>> 0, n);
@@ -791,6 +793,22 @@ function respond(page, csrfToken, gzipOk) {
   // The body CRC (with page id, length and a CRC of the token) names this body.
   const etag = `W/"${body.length.toString(16)}-${BOOT_TAG}${page.id.toString(36)}.${crc.toString(36)}.${zlib.crc32(t1).toString(36)}"`;
   return { body, etag, gz: true };
+}
+// Cached-page bodies are cut from a 1 MB slab and never reused: a body still
+// being written keeps its old slab alive, and a full slab is replaced. This
+// skips one ArrayBuffer allocation per hit.
+const SLAB = 1 << 20;
+let slab = null,
+  slabAt = 0;
+function slabBuffer(size) {
+  if (size > SLAB >>> 3) return Buffer.allocUnsafe(size);
+  if (slab === null || slabAt + size > SLAB) {
+    slab = Buffer.allocUnsafeSlow(SLAB);
+    slabAt = 0;
+  }
+  const b = slab.subarray(slabAt, slabAt + size);
+  slabAt = (slabAt + size + 7) & ~7;
+  return b;
 }
 function emitQuick(req, res, page) {
   const e = req.app.get("etag");

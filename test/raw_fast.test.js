@@ -169,6 +169,7 @@ test("raw fast path answers repeats exactly like the Express path", async () => 
       const slow = await raw(path, headers);
       rawFastStats.enabled = true;
       const hits = rawFastStats.hits;
+      const fastAt = Date.now();
       const fast = await raw(path, headers);
       const label = path + " " + JSON.stringify(v);
       if (isGzip(slow)) assert.equal(rawFastStats.hits, hits + 1, label);
@@ -189,6 +190,17 @@ test("raw fast path answers repeats exactly like the Express path", async () => 
         assert.notEqual(tokens[0], text(slow).match(TOKEN)[0]);
       }
       assert.ok(new Set(tokens).size <= 1, label);
+      // Within one clock second a repeat reuses the built body and headers.
+      if (isGzip(slow)) {
+        const s0 = Math.floor(Date.now() / 1000);
+        const again = await raw(path, headers);
+        if (
+          Math.floor(Date.now() / 1000) === s0 &&
+          s0 === Math.floor(fastAt / 1000)
+        ) {
+          assert.ok(again.body.equals(fast.body), label);
+        }
+      }
       checked++;
     }
   assert.equal(checked, 25);
