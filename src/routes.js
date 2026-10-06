@@ -1347,29 +1347,53 @@ function registerSearch(app) {
       }
       return res.redirect("/searches?" + new URLSearchParams({ q: query }));
     }
-    sendPage(req, res, "search", cacheEpoch(), query, () => {
-      let rows = [];
-      if (query) {
-        const ids = all(
-          "SELECT m.id FROM messages m JOIN message_search_index idx ON idx.rowid=m.id JOIN memberships ms ON ms.room_id=m.room_id WHERE ms.user_id=? AND idx.body MATCH ? ORDER BY m.created_at DESC LIMIT 100",
-          req.user.id,
-          query
-            .split(/\s+/)
-            .map((word) => '"' + word.replaceAll('"', '""') + '"')
-            .join(" "),
-        ).map((r) => r.id);
-        rows = messagesByIds(ids).sort((a, b) =>
-          a.created_at.localeCompare(b.created_at),
-        );
+    const ep = cacheEpoch();
+    sendPage(req, res, "search", ep, query, () => {
+      // Rows only (not the page): reused while no process has written,
+      // because any write changes the epoch.
+      const key = req.user.id + "\n" + query;
+      if (ep !== searchEpoch) {
+        searchCache.clear();
+        searchEpoch = ep;
+      }
+      let found = ep !== -1 && ep != null && searchCache.get(key);
+      if (!found) {
+        found = searchData(req.user.id, query);
+        if (ep !== -1 && ep != null && cacheEpoch() === ep) {
+          if (searchCache.size >= SEARCH_CAP)
+            searchCache.delete(searchCache.keys().next().value);
+          searchCache.set(key, found);
+        }
       }
       return {
-        MessageRows: rows,
+        MessageRows: found.rows,
         Query: query,
-        RecentSearches: all(
-          "SELECT query FROM searches WHERE user_id=? ORDER BY updated_at DESC LIMIT 10",
-          req.user.id,
-        ).map((s) => s.query),
+        RecentSearches: found.recent,
       };
     });
   });
+}
+const SEARCH_CAP = 256;
+const searchCache = new Map();
+let searchEpoch = null;
+function searchData(userId, query) {
+  let rows = [];
+  if (query) {
+    const ids = all(
+      "SELECT m.id FROM messages m JOIN message_search_index idx ON idx.rowid=m.id JOIN memberships ms ON ms.room_id=m.room_id WHERE ms.user_id=? AND idx.body MATCH ? ORDER BY m.created_at DESC LIMIT 100",
+      userId,
+      query
+        .split(/\s+/)
+        .map((word) => '"' + word.replaceAll('"', '""') + '"')
+        .join(" "),
+    ).map((r) => r.id);
+    rows = messagesByIds(ids).sort((a, b) =>
+      a.created_at.localeCompare(b.created_at),
+    );
+  }
+  const recent = all(
+    "SELECT query FROM searches WHERE user_id=? ORDER BY updated_at DESC LIMIT 10",
+    userId,
+  ).map((s) => s.query);
+  return { rows, recent };
 }

@@ -67,6 +67,13 @@ HTML is the same. Checked: decoded body byte-identical to the earlier code,
 the parity harness (only the expected header differences), and a rename, an
 account setting change and an unread mark written by a second process all
 show up on the next sidebar request.
+Search data cache (`registerSearch` in `src/routes.js`): the result rows and
+the recent-search list for one (user id, cleaned query) are kept per process
+under the `epoch()` read before the queries, at most 256 entries, and dropped
+when `epoch()` moves. It holds database rows only; the page is still rendered
+per request (also on not-crazy-perf, which has no page cache). Rows are not
+changed after they are read. GET `/searches` writes nothing, as in Rails (only
+POST records a search), so repeat searches stay warm until some write.
 
 Raw repeat path (`fastPath` in `src/app.js`): when a hot GET (room, messages
 page, sidebar, search) is answered from the page cache through the normal

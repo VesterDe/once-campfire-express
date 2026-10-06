@@ -488,6 +488,37 @@ ${d.Invitation ? call("room_invitation", d) : ""}${messagesHTML ?? messages(d)}<
 </div>${layoutEnd(d)}`;
 }
 
+// Search page macros (search, search_nav, recent_searches, search_composer).
+// `{% if list %}` in nunjucks is JS truthiness, so an empty array is true.
+function recentSearches(d) {
+  const list = d.RecentSearches;
+  let out = "";
+  if (list)
+    for (let i = 0; i < list.length; i++) {
+      const q = e(list[i]);
+      out += `<a class="align-center gap room btn txt-nowrap" href="/searches?q=${q}"><span class="overflow-ellipsis">“${q}”</span></a>`;
+    }
+  if (list)
+    out += `<form class="button_to" method="post" action="/searches/clear"><input type="hidden" name="_method" value="delete"><button class="btn searches__btn" data-turbo-confirm="Are you sure you want to clear your recent searches?" type="submit"><img aria-hidden="true" src="${A("broom.svg")}"><span class="for-screen-reader">Clear recent searches</span></button></form>`;
+  return out;
+}
+function searchNav(d) {
+  const head = d.Query
+    ? `<div class="searches__query flex align-center gap pad-block-start-half"><div class="btn btn--reversed btn--faux align-center gap txt-nowrap"><span class="overflow-ellipsis">“${e(d.Query)}”</span><span class="flex-item-no-shrink">${len(d.Messages)}</span></div></div>`
+    : "";
+  return `${head}<div class="searches__recents align-center gap pad-block-half overflow-y overflow-hide-scrollbar">${recentSearches(d)}</div>`;
+}
+function searchComposer(d) {
+  return `<div class="composer flex align-end gap"><a class="btn flex-item-no-shrink margin-block-end" style="view-transition-name: input-switcher; --btn-border-radius: 0.5em" href="/rooms/${e(d.ReturnRoom)}"><img aria-hidden="true" src="${A("arrow-left.svg")}"><span class="for-screen-reader">Exit search</span></a><form class="margin-block flex-item-grow contain flex align-center gap" data-controller="form" data-action="keydown.esc-&gt;form#cancel" action="/searches" accept-charset="UTF-8" method="post"><div class="composer__input flex align-center flex-item-grow gap full-width input input--actor min-width"><img aria-hidden="true" class="composer__input-hint colorize--black" style="view-transition-name: input-btn" src="${A("search.svg")}" width="20" height="20"><input value="${e(d.Query)}" class="searches__input input flex-item-grow" role="searchbox" aria-label="search" autofocus required type="text" name="q" id="q"><a data-form-target="cancel" role="button" class="searches__reset" href="/searches"><img aria-hidden="true" class="colorize--black" src="${A("remove.svg")}" width="14" height="14"><span class="for-screen-reader">Clear search field</span></a><button name="button" type="submit" class="btn btn--reversed flex-item-no-shrink txt-small" style="--btn-border-radius: 0.5em"><img aria-hidden="true" src="${A("arrow-up.svg")}"><span class="for-screen-reader">Search</span></button></div></form></div>`;
+}
+function search(d) {
+  return `${layoutStart(d)}
+<div id="message-area" class="message-area">
+  <div class="message-area--empty min-width center"><figure class="center pad"><img aria-hidden="true" class="colorize--black translucent" src="${A("search.svg")}"></figure></div>
+  <div id="search-results" class="messages searches__results" data-controller="search-results" data-search-results-target="messages" data-search-results-me-class="message--me" data-search-results-threaded-class="message--threaded" data-search-results-mentioned-class="message--mentioned" data-search-results-formatted-class="message--formatted">${messages(d)}</div>
+</div>${layoutEnd(d)}`;
+}
+
 // Name used by fragment(name) -> fast builder, for the macros covered here.
 export const fast = {
   message,
@@ -509,4 +540,8 @@ export const fast = {
   notification_bell: notificationBell,
   layout_start: layoutStart,
   layout_end: layoutEnd,
+  search,
+  search_nav: searchNav,
+  recent_searches: recentSearches,
+  search_composer: searchComposer,
 };
