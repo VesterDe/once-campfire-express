@@ -137,22 +137,31 @@ export function messageData(messages, origin = "", fresh = null) {
     placeholders = ids.map(() => "?").join(",");
   // fresh: body of a message this request just created without attachment
   // (so no blob or boost rows exist for it yet).
-  const bodies = fresh !== null ? new Map([[ids[0], fresh || ""]]) : new Map(
-    all(
-      `SELECT record_id,body FROM action_text_rich_texts WHERE record_type='Message' AND name='body' AND record_id IN (${placeholders})`,
-      ...ids,
-    ).map((r) => [r.record_id, r.body || ""]),
-  );
-  const blobs = fresh !== null ? new Map() : new Map(
-    all(
-      `SELECT a.record_id,b.* FROM active_storage_attachments a JOIN active_storage_blobs b ON b.id=a.blob_id WHERE a.record_type='Message' AND a.name='attachment' AND a.record_id IN (${placeholders})`,
-      ...ids,
-    ).map((r) => [r.record_id, r]),
-  );
-  const boosts = fresh !== null ? [] : all(
-    `SELECT b.*,u.name,u.bio,u.updated_at AS booster_updated_at FROM boosts b JOIN users u ON u.id=b.booster_id WHERE b.message_id IN (${placeholders}) ORDER BY b.created_at`,
-    ...ids,
-  );
+  const bodies =
+    fresh !== null
+      ? new Map([[ids[0], fresh || ""]])
+      : new Map(
+          all(
+            `SELECT record_id,body FROM action_text_rich_texts WHERE record_type='Message' AND name='body' AND record_id IN (${placeholders})`,
+            ...ids,
+          ).map((r) => [r.record_id, r.body || ""]),
+        );
+  const blobs =
+    fresh !== null
+      ? new Map()
+      : new Map(
+          all(
+            `SELECT a.record_id,b.* FROM active_storage_attachments a JOIN active_storage_blobs b ON b.id=a.blob_id WHERE a.record_type='Message' AND a.name='attachment' AND a.record_id IN (${placeholders})`,
+            ...ids,
+          ).map((r) => [r.record_id, r]),
+        );
+  const boosts =
+    fresh !== null
+      ? []
+      : all(
+          `SELECT b.*,u.name,u.bio,u.updated_at AS booster_updated_at FROM boosts b JOIN users u ON u.id=b.booster_id WHERE b.message_id IN (${placeholders}) ORDER BY b.created_at`,
+          ...ids,
+        );
   const boostsByMessage = new Map();
   for (const b of boosts) {
     let list = boostsByMessage.get(b.message_id);

@@ -222,15 +222,15 @@ export function createMessage(
     // the last post's statements write the same rows an earlier post's would.
     if (defer) defer.unread = [Number(roomId), Number(userId), time, cutoff];
     else {
-    run("UPDATE rooms SET updated_at=? WHERE id=?", time, Number(roomId));
-    run(
-      "UPDATE memberships SET unread_at=?,updated_at=? WHERE room_id=? AND user_id<>? AND involvement<>'invisible' AND (connected_at IS NULL OR connected_at<?)",
-      time,
-      time,
-      Number(roomId),
-      Number(userId),
-      cutoff,
-    );
+      run("UPDATE rooms SET updated_at=? WHERE id=?", time, Number(roomId));
+      run(
+        "UPDATE memberships SET unread_at=?,updated_at=? WHERE room_id=? AND user_id<>? AND involvement<>'invisible' AND (connected_at IS NULL OR connected_at<?)",
+        time,
+        time,
+        Number(roomId),
+        Number(userId),
+        cutoff,
+      );
     }
     const message = messageById(id);
     createdContent.set(message, content);

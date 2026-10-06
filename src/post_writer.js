@@ -2,11 +2,7 @@ import cluster from "node:cluster";
 import { transaction, writeTransaction } from "./db.js";
 import { stagedFiles } from "./storage.js";
 import { sanitize, plainText } from "./richtext.js";
-import {
-  createMessage,
-  applyUnread,
-  rememberCreated,
-} from "./domain.js";
+import { createMessage, applyUnread, rememberCreated } from "./domain.js";
 // Group commit: posts without attachments that arrive while the write lock is being
 // acquired share one transaction (each in its own savepoint). Every response is
 // sent only after the shared COMMIT.
@@ -74,9 +70,7 @@ async function flushPosts() {
                   } catch (error) {
                     p.error = error;
                   }
-                applyUnread(
-                  batch.filter((p) => !p.error).map((p) => p.unread),
-                );
+                applyUnread(batch.filter((p) => !p.error).map((p) => p.unread));
               }),
             ),
           );
@@ -127,7 +121,8 @@ if (clustered && cluster.isPrimary)
     ).then(
       (message) => reply({ type: "post-done", id: event.id, message }),
       (error) => {
-        if (!(Number(error?.status) < 500)) console.error(error?.stack || error);
+        if (!(Number(error?.status) < 500))
+          console.error(error?.stack || error);
         reply({
           type: "post-done",
           id: event.id,
@@ -146,6 +141,14 @@ export function queuePost(roomId, userId, body, clientId) {
   return new Promise((resolve, reject) => {
     const id = ++seq;
     pending.set(id, { resolve, reject, content });
-    process.send({ type: "post", id, roomId, userId, clientId, content, plain });
+    process.send({
+      type: "post",
+      id,
+      roomId,
+      userId,
+      clientId,
+      content,
+      plain,
+    });
   });
 }
