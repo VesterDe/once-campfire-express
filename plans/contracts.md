@@ -9,7 +9,7 @@ the compatibility contract. Raw evidence stays ignored in `tmp/`.
 | Rails signing, encryption and CSRF | Independent Rails vectors verify PBKDF2 keys, signed/encrypted cookies, signed IDs including large integers, SGIDs, application verifiers, Turbo streams, session continuity, purpose/expiry/signature rejection and 189 CSRF cases. Bounded data-only Marshal fixtures come from Ruby. |
 | SQLite and messages | Real isolated databases test nested rollback, membership authorization, raw timestamp cursors, persisted writes, updates/deletion and FTS; independent HTTP checks compare actual stored records. |
 | Frontend | Independent browser checks cover live compose/edit/delete/boost, mentions, paging, search, private/direct rooms, image upload/lightbox, administration and fresh setup. |
-| Sessions | Independent original Rails server accepts Express-issued cookies and Express accepts Rails-issued cookies on shared disposable data. |
+| Sessions | Independent original Rails server accepts Express-issued cookies and Express accepts Rails-issued cookies on shared disposable data. An identical session update from the same incoming cookie reuses the value encrypted under one second earlier (embedded expiry lags by under one second). |
 | Action Cable | Real sockets verify native subscription delivery, forged stream rejection, membership revocation, logout revocation and multi-tab presence. Cross-worker production browser delivery is exercised. |
 | Storage and media | Actual 3840×2160 JPEG becomes 1200×675; real ffmpeg audio/video analysis and poppler PDF preview; Rails-issued signed transform accepted; direct upload checksum/range/owner/private-room checks and failed-media rollback. |
 | Benchmarks | Matched production images with identical ordered 40-room/40-page/13-search windows, zero timed request failures, every acknowledged write stored with rich text and FTS, and SQLite integrity checks. Two paced runs admit all 100 sockets and deliver all 30 messages to every connection. Raw output remains ignored. |
@@ -34,3 +34,51 @@ higher tail latency than Rails; the table reports the median, not a capacity lim
 The unchanged common load generator and original seed hashes are recorded in ignored
 scratch evidence. Benchmark orchestration is Ruby, and server processes share four
 hardware threads; Express uses three HTTP workers and its primary job/fanout process.
+
+## Page and message HTML caches
+
+Room, messages-page, sidebar, search and single-message pages are cached per
+process (`src/rendering.js`): one entry per message (key: message id + origin,
+checked against the presentation row) and one entry per page (key: route
+inputs, full user row, host, protocol, Turbo-Frame, session last room). All
+entries are dropped when `epoch()` in `src/db.js` moves, which happens on any
+commit from any process. The decoded HTML is byte-identical to an uncached
+render except for the random CSRF token. Deliberate differences: gzip bytes
+are made by the app (one stored gzip for pages without a token; for pages with
+a token, a prebuilt stream whose token bytes are patched per request), so the
+compressed bytes and the `ETag` values differ from what the compression
+middleware and Express would make; brotli, deflate, identity and HEAD still
+go through the normal middleware. Verified by decoding with Node zlib, Ruby
+`Zlib::GzipReader` and `curl --compressed` against the uncached code on a
+seeded database before and after boosts, edits, renames and posts.
+
+Raw repeat path (`fastPath` in `src/app.js`): when a hot GET (room, messages
+page, sidebar, search) is answered from the page cache through the normal
+path, the app records the response headers and the derived request state. A
+later GET with the same URL, client address and byte-identical raw header
+list is answered with one `writeHead` + `end`, without Express, while all of
+these still hold: same `epoch()`, same page cache entry, session activity
+newer than one hour (no `last_active_at` write due), cookie expiries in the
+future, unchanged secret, and, when a session cookie is set (room pages set
+`last_room_id`), the memoized encrypted cookie is still valid (under one
+second old, the same 1 s staleness the normal path allows). The CSRF mask,
+`ETag`, `Content-Length` and cookie `Expires` are made fresh once per entry
+per clock second: repeats in the same second reuse the built body and header
+list (deliberate difference: Rails re-masks per request; the reused masked
+token still unmasks to the session's CSRF secret).
+New sessions, bot keys, conditional requests, non-gzip token pages and any
+other case use the normal path. `test/raw_fast.test.js` compares status,
+header order and values (except `Date`, the CSRF-dependent `ETag` part and
+the `Expires` second) and decoded bodies of both paths.
+
+`epoch()` first reads the 96-byte WAL-index header at the start of the
+`-shm` file. Every commit by any connection (this one included) and every WAL
+restart rewrites that header (change counter, frame count, salts, checksums;
+copy 1 is written before copy 0). If both copies are equal and identical to
+the header read before the last SQL check, no commit can have happened since,
+and the SQL (`data_version`, `total_changes()`) is skipped. Otherwise, or in a
+non-WAL database or with `EPOCH_SHM=0`, the SQL runs as before.
+`test/epoch_shm.test.js` checks that commits from both connections and WAL
+restarts move the epoch. Limit: this relies on SQLite's documented WAL-index
+layout and on `read()` of the `-shm` file seeing the shared mapping (true on
+Linux and macOS, which share one page cache for both).
