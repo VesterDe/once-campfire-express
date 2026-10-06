@@ -543,23 +543,26 @@ export function registerRoutes(app) {
               item === null ? (createdBody(shown) ?? null) : null,
             )[0],
           );
-        announceMessage(message, html, room);
+        // The message is committed: answer first, then broadcast and enqueue
+        // notifications in the same tick.
         if (isBot)
-          return res
+          res
             .status(201)
             .set(
               "Location",
               `${origin(req)}/rooms/${room.id}/messages/${message.id}`,
             )
             .end();
-        if (json)
-          return res.status(201).json(serializeMessage(shown, req));
-        return turbo(
-          res,
-          "append",
-          `messages_rooms_${room.type.split("::").pop().toLowerCase()}_${room.id}`,
-          html,
-        );
+        else if (json) res.status(201).json(serializeMessage(shown, req));
+        else
+          turbo(
+            res,
+            "append",
+            `messages_rooms_${room.type.split("::").pop().toLowerCase()}_${room.id}`,
+            html,
+          );
+        announceMessage(message, html, room);
+        return;
       }
       if (["PATCH", "PUT"].includes(req.method)) {
         const blob = await prepareMessageAttachment({ ...req, user }, item);
