@@ -349,6 +349,8 @@ export const roomMembers = (roomId) =>
   );
 // Publish a newly created message with pre-rendered html, then notify, sharing one memberships read.
 export const createdBody = (message) => createdContent.get(message);
+export const rememberCreated = (message, content) =>
+  createdContent.set(message, content);
 export function announceMessage(message, html, room) {
   const members = roomMembers(room.id);
   publishMessage(message, "append", html, room, members);

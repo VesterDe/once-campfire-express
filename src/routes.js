@@ -11,7 +11,6 @@ import {
   grantMemberships,
   createUser,
   createMessage,
-  applyUnread,
   createdBody,
   updateMessage,
   deleteMessage,
@@ -38,6 +37,7 @@ import {
 } from "./rendering.js";
 import { escape, plainText, messagePlainText } from "./richtext.js";
 import * as rails from "./rails.js";
+import { queuePost } from "./post_writer.js";
 import { publish } from "./cable.js";
 import {
   storeUpload,
@@ -187,56 +187,6 @@ export function serializeMessage(m, req) {
     room: { id: m.room_id },
     url: `${origin(req)}/rooms/${m.room_id}/messages/${m.id}`,
   };
-}
-// Group commit: posts without attachments that arrive while the write lock is being
-// acquired share one transaction (each in its own savepoint). Every response is
-// sent only after the shared COMMIT.
-const postQueue = [];
-let postFlushing = false;
-function queuePost(roomId, userId, body, clientId) {
-  return new Promise((resolve, reject) => {
-    postQueue.push({ roomId, userId, body, clientId, resolve, reject });
-    if (!postFlushing) {
-      postFlushing = true;
-      setImmediate(flushPosts);
-    }
-  });
-}
-async function flushPosts() {
-  try {
-    while (postQueue.length) {
-      let batch = null;
-      try {
-        await writeTransaction(() =>
-          stagedFiles(() =>
-            transaction(() => {
-              batch = postQueue.splice(0);
-              for (const p of batch)
-                try {
-                  p.message = createMessage(
-                    p.roomId,
-                    p.userId,
-                    p.body,
-                    p.clientId,
-                    true,
-                    p,
-                  );
-                } catch (error) {
-                  p.error = error;
-                }
-              applyUnread(batch.filter((p) => !p.error).map((p) => p.unread));
-            }),
-          ),
-        );
-      } catch (error) {
-        for (const p of batch || postQueue.splice(0)) p.reject(error);
-        continue;
-      }
-      for (const p of batch) p.error ? p.reject(p.error) : p.resolve(p.message);
-    }
-  } finally {
-    postFlushing = false;
-  }
 }
 const turbo = (res, action, target, body = "") =>
   res
