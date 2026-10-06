@@ -428,3 +428,33 @@ test("layout start and end match nunjucks on other screens", () => {
     same("layout_end", dot);
   }
 });
+
+test("search page builders match the nunjucks macros", () => {
+  const admin = domain.userById(users[0].id);
+  const names = ["search", "search_nav", "recent_searches", "search_composer"];
+  const rows = ids.map((id) => domain.messageById(id));
+  const dots = [
+    {},
+    { Query: `q "x" & y`, RecentSearches: ["a", "b<c>", odd] },
+    { Query: "coffee", RecentSearches: [], Messages: rows, ReturnRoom: 7 },
+    { Query: "", RecentSearches: null, MessagesHTML: safe("<i>marked</i>") },
+    { Query: "two words", RecentSearches: ["two words"], Messages: rows },
+  ];
+  for (const extra of dots) {
+    const dot = pageDot(admin, "search", extra);
+    for (const name of names) {
+      const builder = F.fast[name];
+      // Without the fast builders, fragment() renders every search macro
+      // with nunjucks.
+      const saved = names.map((n) => [n, F.fast[n]]);
+      for (const n of names) delete F.fast[n];
+      let want;
+      try {
+        want = R.fragment(name, dot);
+      } finally {
+        for (const [n, f] of saved) F.fast[n] = f;
+      }
+      assert.equal(builder(dot), want, name);
+    }
+  }
+});
