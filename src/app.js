@@ -386,7 +386,11 @@ function findFast(req) {
   }
   return undefined;
 }
+// Bumped on every change to fastEntries; a net front socket reuses the entry
+// it found for the same parsed head while this has not moved.
+let fastGen = 0;
 function dropFast(e) {
+  fastGen++;
   const list = fastEntries.get(e.url);
   if (list === undefined) return;
   const i = list.indexOf(e);
@@ -491,6 +495,7 @@ function recordFast(req, res, args, sessionJson, expiry) {
   }
   const old = findFast(req);
   if (old !== undefined) dropFast(old);
+  fastGen++;
   if (fastEntries.size >= 1000) fastEntries.clear();
   let list = fastEntries.get(req.url);
   if (list === undefined) fastEntries.set(req.url, (list = []));
@@ -523,11 +528,26 @@ function rawFast(e, req, res) {
 }
 // Validity checks plus the per-second build. ep is a db epoch already read in
 // this same synchronous run (net front, pipelined batch) or -2 to read it now.
+// process.env reads go to the C++ environment; read the secret once per
+// event-loop turn (a change takes effect from the next turn).
+let turnSecret,
+  secretArmed = false;
+const secretReset = () => {
+  secretArmed = false;
+};
+function currentSecret() {
+  if (!secretArmed) {
+    secretArmed = true;
+    turnSecret = process.env.SECRET_KEY_BASE;
+    setImmediate(secretReset);
+  }
+  return turnSecret;
+}
 function rawBuilt(e, t, ep) {
   if (
     !(t < e.validUntil) ||
     !rails.realClock ||
-    e.secret !== process.env.SECRET_KEY_BASE ||
+    e.secret !== currentSecret() ||
     (ep === -2 ? epoch() : ep) !== e.epoch ||
     e.epoch !== cachedEpoch ||
     !pageCurrent(e.key, e.page, e.epoch)
@@ -569,13 +589,20 @@ function rawBuilt(e, t, ep) {
 // Buffer, byte-identical to what node:http writes for rawFast (headers, then
 // Date, Connection: keep-alive and Keep-Alive), or null to use node:http.
 const fakeReq = { url: "", rawHeaders: null, socket: { remoteAddress: "" } };
-export function netFast(url, rawHeaders, addr, tail, ep) {
+export function netFast(url, rawHeaders, addr, tail, ep, hint) {
   if (!rawFastStats.enabled) return null;
-  fakeReq.url = url;
-  fakeReq.rawHeaders = rawHeaders;
-  fakeReq.socket.remoteAddress = addr;
-  const e = findFast(fakeReq);
-  if (e === undefined) return null;
+  let e;
+  if (hint.gen === fastGen && hint.raw === rawHeaders) e = hint.e;
+  else {
+    fakeReq.url = url;
+    fakeReq.rawHeaders = rawHeaders;
+    fakeReq.socket.remoteAddress = addr;
+    e = findFast(fakeReq);
+    if (e === undefined) return null;
+    hint.gen = fastGen;
+    hint.raw = rawHeaders;
+    hint.e = e;
+  }
   const t = Date.now();
   const c = rawBuilt(e, t, ep);
   if (c === null) return null;

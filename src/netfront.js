@@ -98,6 +98,8 @@ function lookupHead(text) {
   return p;
 }
 
+let tailKat = NaN,
+  tailText = "";
 export function createFront(httpServer) {
   const open = new Set();
   const front = net.createServer({ noDelay: true }, (socket) => {
@@ -105,6 +107,7 @@ export function createFront(httpServer) {
     let pending = null,
       lastBuf = null,
       lastP = null;
+    const hint = { gen: -1, raw: null, e: null };
     const addr = socket.remoteAddress;
     const handle = socket._handle;
     const origRead =
@@ -178,11 +181,15 @@ export function createFront(httpServer) {
       pending = null;
       const kat = httpServer.keepAliveTimeout;
       if (httpServer.maxRequestsPerSocket > 0) return handOff(buf);
-      const tail =
-        "Connection: keep-alive\r\n" +
-        (kat > 0
-          ? "Keep-Alive: timeout=" + Math.floor(kat / 1000) + "\r\n"
-          : "");
+      if (kat !== tailKat) {
+        tailKat = kat;
+        tailText =
+          "Connection: keep-alive\r\n" +
+          (kat > 0
+            ? "Keep-Alive: timeout=" + Math.floor(kat / 1000) + "\r\n"
+            : "");
+      }
+      const tail = tailText;
       let ep = -2,
         corked = false;
       for (;;) {
@@ -208,7 +215,7 @@ export function createFront(httpServer) {
         }
         if (p === null) break;
         if (ep === -2) ep = turnEpoch();
-        const out = netFast(p.url, p.raw, addr, tail, ep);
+        const out = netFast(p.url, p.raw, addr, tail, ep, hint);
         const rest = buf.subarray(end + 4);
         if (out === null) {
           if (corked) socket.uncork();
