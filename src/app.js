@@ -519,17 +519,26 @@ function recordFast(req, res, args, sessionJson, expiry) {
   });
 }
 function rawFast(e, req, res) {
-  const t = Date.now();
+  const c = rawBuilt(e, Date.now(), -2);
+  if (c === null) return false;
+  rawFastStats.hits++;
+  res.writeHead(e.status, c.h);
+  res.end(c.body);
+  return true;
+}
+// Validity checks plus the per-second build. ep is a db epoch already read in
+// this same synchronous run (net front, pipelined batch) or -2 to read it now.
+function rawBuilt(e, t, ep) {
   if (
     !(t < e.validUntil) ||
     !rails.realClock ||
     e.secret !== process.env.SECRET_KEY_BASE ||
-    epoch() !== e.epoch ||
+    (ep === -2 ? epoch() : ep) !== e.epoch ||
     e.epoch !== cachedEpoch ||
     !pageCurrent(e.key, e.page, e.epoch)
   ) {
     dropFast(e);
-    return false;
+    return null;
   }
   if (e.sessKey !== null) {
     const memo = sessionCookies.get(e.sessKey),
@@ -540,7 +549,7 @@ function rawFast(e, req, res) {
       memo.secret !== e.secret ||
       !(memo.expiry <= expiry && expiry - memo.expiry < 1000)
     )
-      return false;
+      return null;
   }
   // Body and headers are built once per entry per clock second: the CSRF
   // mask, ETag and cookie Expires stay the same within that second.
@@ -548,7 +557,7 @@ function rawFast(e, req, res) {
   let c = e.built;
   if (c === undefined || c.sec !== sec) {
     const r = fastPageBody(e.page, e.csrf, e.gzipOk);
-    if (r === null) return false;
+    if (r === null) return null;
     const h = e.template.slice(),
       s = e.slots;
     h[s.len] = String(r.body.length);
@@ -557,12 +566,37 @@ function rawFast(e, req, res) {
       const x = expiresText(t);
       for (const [i, a, b] of s.cookies) h[i] = a + x + b;
     }
-    c = e.built = { sec, h, body: r.body };
+    c = e.built = { sec, h, body: r.body, net: null, tail: "" };
+  }
+  return c;
+}
+// Net front entry (src/netfront.js): the whole HTTP/1.1 response as one
+// Buffer, byte-identical to what node:http writes for rawFast (headers, then
+// Date, Connection: keep-alive and Keep-Alive), or null to use node:http.
+const fakeReq = { url: "", rawHeaders: null, socket: { remoteAddress: "" } };
+export function netFast(url, rawHeaders, addr, tail, ep) {
+  if (!rawFastStats.enabled) return null;
+  fakeReq.url = url;
+  fakeReq.rawHeaders = rawHeaders;
+  fakeReq.socket.remoteAddress = addr;
+  const e = findFast(fakeReq);
+  if (e === undefined) return null;
+  const t = Date.now();
+  const c = rawBuilt(e, t, ep);
+  if (c === null) return null;
+  if (c.net === null || c.tail !== tail) {
+    const h = c.h;
+    let head = "HTTP/1.1 200 OK\r\n";
+    for (let i = 0; i < h.length; i += 2)
+      head += h[i] + ": " + h[i + 1] + "\r\n";
+    head +=
+      "Date: " + new Date(c.sec * 1000).toUTCString() + "\r\n" + tail + "\r\n";
+    const hb = Buffer.from(head, "latin1");
+    c.net = Buffer.concat([hb, c.body], hb.length + c.body.length);
+    c.tail = tail;
   }
   rawFastStats.hits++;
-  res.writeHead(e.status, c.h);
-  res.end(c.body);
-  return true;
+  return c.net;
 }
 export function createApp() {
   initialize();
