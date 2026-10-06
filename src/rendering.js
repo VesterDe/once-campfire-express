@@ -1,6 +1,6 @@
 import nunjucks from "nunjucks";
 import { readFileSync, existsSync } from "node:fs";
-import { randomUUID, createHash } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { createRequire } from "node:module";
 import zlib from "node:zlib";
 import { all, get, epoch as dbEpoch } from "./db.js";
@@ -442,7 +442,7 @@ const usable = (ep) => ep !== -1 && ep != null && cacheEpoch() === ep;
 const SYNC6 = { finishFlush: zlib.constants.Z_SYNC_FLUSH };
 const SYNC1 = { level: 1, finishFlush: zlib.constants.Z_SYNC_FLUSH };
 function piece(text, level) {
-  return { raw: Buffer.from(text), z: null, level, crc: -1, shift: 0 };
+  return { raw: Buffer.from(text), z: null, level, crc: -1, shift: null };
 }
 // CRC-32 of the joined pieces by zlib's crc32_combine: each piece keeps its
 // own CRC and x^(8*length) mod P, so a request does one multiply per piece
@@ -473,14 +473,43 @@ function byteShift(n) {
   }
   return p >>> 0;
 }
+// Multiplying by x^(8*n) is linear, so it is kept as 8 tables of 16 values
+// (one per 4-bit group of the CRC), one set per length n.
+const SHIFT_CAP = 4096;
+const shiftTables = new Map();
+function shiftTable(n) {
+  let t = shiftTables.get(n);
+  if (t) return t;
+  const s = byteShift(n);
+  t = new Int32Array(128);
+  for (let k = 0; k < 8; k++)
+    for (let v = 1; v < 16; v++) t[k * 16 + v] = gfMul(s, (v << (4 * k)) >>> 0);
+  if (shiftTables.size >= SHIFT_CAP) shiftTables.clear();
+  shiftTables.set(n, t);
+  return t;
+}
 function crcOf(p) {
   if (p.crc === -1) {
     p.crc = zlib.crc32(p.raw);
-    p.shift = byteShift(p.raw.length);
+    p.shift = shiftTable(p.raw.length);
   }
   return p;
 }
-const crcJoin = (crc, p) => (gfMul(p.shift, crc) ^ p.crc) >>> 0;
+function crcJoin(crc, p) {
+  const t = p.shift;
+  return (
+    (t[crc & 15] ^
+      t[16 + ((crc >>> 4) & 15)] ^
+      t[32 + ((crc >>> 8) & 15)] ^
+      t[48 + ((crc >>> 12) & 15)] ^
+      t[64 + ((crc >>> 16) & 15)] ^
+      t[80 + ((crc >>> 20) & 15)] ^
+      t[96 + ((crc >>> 24) & 15)] ^
+      t[112 + (crc >>> 28)] ^
+      p.crc) >>>
+    0
+  );
+}
 const zOf = (p) =>
   p.z || (p.z = zlib.deflateRawSync(p.raw, p.level === 1 ? SYNC1 : SYNC6));
 function splitForms(html) {
@@ -569,6 +598,7 @@ function buildPage(layout, entries, tokens) {
 }
 let pageSeq = 0;
 const BOOT = randomUUID();
+const ETAG_BOOT = BOOT.slice(0, 8);
 // Express would hash the whole body for its ETag on every request. A fixed
 // page gets that same ETag once; a page with a CSRF token gets one built from
 // the page identity and the token, which also changes exactly when the body does.
@@ -576,11 +606,11 @@ function setETag(req, res, page, kind, body, tokenText, length) {
   const fn = req.app?.get?.("etag fn");
   if (!fn) return;
   if (body) return res.set("ETag", (page["etag" + kind] ||= fn(body, "utf8")));
-  const hash = createHash("sha1")
-    .update(`${BOOT}|${page.id}|${kind}|${tokenText}`)
-    .digest("base64")
-    .slice(0, 27);
-  res.set("ETag", `W/"${length.toString(16)}-${hash}"`);
+  // Process boot id, page id and a CRC-32 of the token: no hash object per request.
+  res.set(
+    "ETag",
+    `W/"${length.toString(16)}-${ETAG_BOOT}${page.id.toString(36)}${kind}.${zlib.crc32(tokenText || "").toString(36)}"`,
+  );
 }
 function storePage(key, page) {
   pageCache.set(key, page);
@@ -1001,8 +1031,8 @@ function emit(req, res, page) {
   }
   const s1 = t1 && stored(t1),
     s2 = t2 && stored(t2);
-  const c1 = t1 && crcOf({ raw: t1, crc: -1 }),
-    c2 = t2 && crcOf({ raw: t2, crc: -1 });
+  const c1 = t1 && crcOf({ raw: t1, z: null, level: 0, crc: -1, shift: null }),
+    c2 = t2 && crcOf({ raw: t2, z: null, level: 0, crc: -1, shift: null });
   const list = new Array(page.items.length + 2);
   list[0] = GZ_HEAD;
   let crc = 0,
