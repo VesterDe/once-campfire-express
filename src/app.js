@@ -113,6 +113,35 @@ function sessionCookie(incoming, json, session, expiry) {
   });
   return value;
 }
+// The last_room Set-Cookie text, built exactly as res.cookie() would (same
+// cookie package and options) and reused while its Expires second is the same.
+const cookieLib = createRequire(
+  createRequire(import.meta.url).resolve("express"),
+)("cookie");
+const COOKIE_MAX_AGE = 20 * 365 * 86400 * 1000;
+const lastRoomCookies = new Map();
+function lastRoomCookie(value, secure) {
+  const expires = Date.now() + COOKIE_MAX_AGE;
+  const second = Math.floor(expires / 1000);
+  const key = (secure ? "s" : "-") + value;
+  let hit = lastRoomCookies.get(key);
+  if (hit === undefined || hit.second !== second) {
+    hit = {
+      second,
+      text: cookieLib.serialize("last_room", value, {
+        httpOnly: false,
+        sameSite: "lax",
+        secure,
+        maxAge: Math.floor(COOKIE_MAX_AGE / 1000),
+        path: "/",
+        expires: new Date(expires),
+      }),
+    };
+    if (lastRoomCookies.size >= 1000) lastRoomCookies.clear();
+    lastRoomCookies.set(key, hit);
+  }
+  return hit.text;
+}
 // Process-local copies of rarely changing rows, dropped when epoch() moves.
 let cachedEpoch = null,
   cachedAccount,
@@ -223,10 +252,10 @@ function sessionMiddleware(req, res, next) {
         options,
       );
     if (req.lastRoom !== undefined)
-      res.cookie("last_room", String(req.lastRoom), {
-        ...options,
-        httpOnly: false,
-      });
+      this.append(
+        "Set-Cookie",
+        lastRoomCookie(String(req.lastRoom), options.secure),
+      );
     if (req.fastRecord?.page && !freshSession)
       recordFast(req, this, args, after !== before ? after : null, expiry);
     return writeHead.apply(this, args);
