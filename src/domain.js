@@ -406,12 +406,14 @@ export function notifyMessage(
     )
       for (const w of all("SELECT id FROM webhooks WHERE user_id=?", m.user_id))
         jobs.push(["webhook", { webhook_id: w.id, message_id: message.id }]);
+    // Cheap membership checks first: the subscriptions query runs only when
+    // some member would get a push.
     if (
-      (pushable ??= pushableUsers(message.room_id)).has(m.user_id) &&
+      (m.involvement === "everything" ||
+        (m.involvement === "mentions" && mentions.has(m.user_id))) &&
       (!m.connected_at ||
         Date.now() - Date.parse(m.connected_at + "Z") > 60000) &&
-      (m.involvement === "everything" ||
-        (m.involvement === "mentions" && mentions.has(m.user_id)))
+      (pushable ??= pushableUsers(message.room_id)).has(m.user_id)
     )
       jobs.push(["push", { user_id: m.user_id, message_id: message.id }]);
   }

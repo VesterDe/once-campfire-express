@@ -4,17 +4,17 @@ Native JavaScript/Express implementation; immutable public Rails reference `659f
 Existing SQLite schema, original files, bcrypt credentials and Rails JSON cookies are
 the compatibility contract. Raw evidence stays ignored in `tmp/`.
 
-| Area | Evidence |
-|---|---|
-| Rails signing, encryption and CSRF | Independent Rails vectors verify PBKDF2 keys, signed/encrypted cookies, signed IDs including large integers, SGIDs, application verifiers, Turbo streams, session continuity, purpose/expiry/signature rejection and 189 CSRF cases. Bounded data-only Marshal fixtures come from Ruby. |
-| SQLite and messages | Real isolated databases test nested rollback, membership authorization, raw timestamp cursors, persisted writes, updates/deletion and FTS; independent HTTP checks compare actual stored records. |
-| Frontend | Independent browser checks cover live compose/edit/delete/boost, mentions, paging, search, private/direct rooms, image upload/lightbox, administration and fresh setup. |
-| Sessions | Independent original Rails server accepts Express-issued cookies and Express accepts Rails-issued cookies on shared disposable data. An identical session update from the same incoming cookie reuses the value encrypted under one second earlier (embedded expiry lags by under one second). |
-| Action Cable | Real sockets verify native subscription delivery, forged stream rejection, membership revocation, logout revocation and multi-tab presence. Cross-worker production browser delivery is exercised. |
-| Storage and media | Actual 3840×2160 JPEG becomes 1200×675; real ffmpeg audio/video analysis and poppler PDF preview; Rails-issued signed transform accepted; direct upload checksum/range/owner/private-room checks and failed-media rollback. |
-| Benchmarks | Matched production images with identical ordered 40-room/40-page/13-search windows, zero timed request failures, every acknowledged write stored with rich text and FTS, and SQLite integrity checks. Two paced runs admit all 100 sockets and deliver all 30 messages to every connection. Raw output remains ignored. |
-| Jobs and bots | Actual queued HTTP delivery and persisted bot reply with FTS and recursive-webhook suppression; expired lease recovery, fencing, heartbeat renewal, bounded retries and dead state. |
-| Backup/restore | Actual SQLite/storage round trip with integrity check; archive traversal/link rejection. Stop writers for consistency with file lifecycle. |
+| Area                               | Evidence                                                                                                                                                                                                                                                                                                                |
+| ---------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Rails signing, encryption and CSRF | Independent Rails vectors verify PBKDF2 keys, signed/encrypted cookies, signed IDs including large integers, SGIDs, application verifiers, Turbo streams, session continuity, purpose/expiry/signature rejection and 189 CSRF cases. Bounded data-only Marshal fixtures come from Ruby.                                 |
+| SQLite and messages                | Real isolated databases test nested rollback, membership authorization, raw timestamp cursors, persisted writes, updates/deletion and FTS; independent HTTP checks compare actual stored records.                                                                                                                       |
+| Frontend                           | Independent browser checks cover live compose/edit/delete/boost, mentions, paging, search, private/direct rooms, image upload/lightbox, administration and fresh setup.                                                                                                                                                 |
+| Sessions                           | Independent original Rails server accepts Express-issued cookies and Express accepts Rails-issued cookies on shared disposable data. An identical session update from the same incoming cookie reuses the value encrypted under one second earlier (embedded expiry lags by under one second).                          |
+| Action Cable                       | Real sockets verify native subscription delivery, forged stream rejection, membership revocation, logout revocation and multi-tab presence. Cross-worker production browser delivery is exercised.                                                                                                                      |
+| Storage and media                  | Actual 3840×2160 JPEG becomes 1200×675; real ffmpeg audio/video analysis and poppler PDF preview; Rails-issued signed transform accepted; direct upload checksum/range/owner/private-room checks and failed-media rollback.                                                                                             |
+| Benchmarks                         | Matched production images with identical ordered 40-room/40-page/13-search windows, zero timed request failures, every acknowledged write stored with rich text and FTS, and SQLite integrity checks. Two paced runs admit all 100 sockets and deliver all 30 messages to every connection. Raw output remains ignored. |
+| Jobs and bots                      | Actual queued HTTP delivery and persisted bot reply with FTS and recursive-webhook suppression; expired lease recovery, fencing, heartbeat renewal, bounded retries and dead state.                                                                                                                                     |
+| Backup/restore                     | Actual SQLite/storage round trip with integrity check; archive traversal/link rejection. Stop writers for consistency with file lifecycle.                                                                                                                                                                              |
 
 Verification is limited to the exercised workflows, not a claim of exhaustive Rails
 parity. Public-site OpenGraph behavior and live browser-vendor push delivery remain
@@ -146,3 +146,18 @@ chunked and `/users/2` log text differences), persisted rows equal to the
 reference build except push jobs for non-permitted endpoints, `integrity_check`
 ok and an FTS row for every 200 under load. Limit: a crash of the primary
 between `COMMIT` and the IPC reply loses that reply (the post is stored).
+
+Deliberate difference: every response on `POST /rooms/<digits>/messages` is
+sent without gzip when gzip is the negotiated coding (br/deflate clients still
+go through `compression()`). `Vary: Accept-Encoding`, the ETag of the plain
+body and all other headers stay. Rails gzips this answer. Measured: about 14%
+less server CPU per post and about +30% posts/s in the 3-CPU Docker bench
+(4.7-4.9k -> 6.4-6.5k req/s, alternating runs). Also on this path: Express'
+weak ETag is made with one `crypto.hash` call (same value as the `etag`
+package; the `etag` setting stays `weak`), `publishMessage` returns before it
+builds anything when `publish()` would drop it (no WebSocket in any worker),
+the push endpoint check is memoized per endpoint string, and `notifyMessage`
+runs the push-subscriptions query only when some member passes the
+involvement and connection checks. Tried and dropped: one IPC message per tick
+for posts and per batch for replies (no CPU change, lower throughput); 2, 3 and
+6 workers instead of 4 (all slower on the 3-CPU post bench).
