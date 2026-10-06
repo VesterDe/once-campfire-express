@@ -52,6 +52,17 @@ go through the normal middleware. Verified by decoding with Node zlib, Ruby
 `Zlib::GzipReader` and `curl --compressed` against the uncached code on a
 seeded database before and after boosts, edits, renames and posts.
 
+Below the page cache there are three more caches with the same epoch rule.
+`messagesForRoom` (`src/domain.js`) keeps the row list of each room query
+(room id + before/after/around) and freezes the list and its rows; the epoch
+is read before the query, so a list is never filed under a newer epoch than
+its data. The message entries made for one such list are kept with it. Layout
+pieces (the page text between CSRF tokens and the message list) are kept by
+their exact text with their deflate stream and CRC-32. The gzip trailer CRC is
+made with zlib's crc32_combine arithmetic from the per-piece CRCs, so a request
+does not pass over the whole page. None of these is a stored response: the
+page is still joined per request with a fresh CSRF mask.
+
 Raw repeat path (`fastPath` in `src/app.js`): when a hot GET (room, messages
 page, sidebar, search) is answered from the page cache through the normal
 path, the app records the response headers and the derived request state. A
