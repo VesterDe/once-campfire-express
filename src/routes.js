@@ -11,6 +11,7 @@ import {
   grantMemberships,
   createUser,
   createMessage,
+  createdBody,
   updateMessage,
   deleteMessage,
   deleteRoom,
@@ -36,6 +37,7 @@ import {
 } from "./rendering.js";
 import { escape, plainText, messagePlainText } from "./richtext.js";
 import * as rails from "./rails.js";
+import { queuePost } from "./post_writer.js";
 import { publish } from "./cable.js";
 import {
   storeUpload,
@@ -185,54 +187,6 @@ export function serializeMessage(m, req) {
     room: { id: m.room_id },
     url: `${origin(req)}/rooms/${m.room_id}/messages/${m.id}`,
   };
-}
-// Group commit: posts without attachments that arrive while the write lock is being
-// acquired share one transaction (each in its own savepoint). Every response is
-// sent only after the shared COMMIT.
-const postQueue = [];
-let postFlushing = false;
-function queuePost(roomId, userId, body, clientId) {
-  return new Promise((resolve, reject) => {
-    postQueue.push({ roomId, userId, body, clientId, resolve, reject });
-    if (!postFlushing) {
-      postFlushing = true;
-      setImmediate(flushPosts);
-    }
-  });
-}
-async function flushPosts() {
-  try {
-    while (postQueue.length) {
-      let batch = null;
-      try {
-        await writeTransaction(() =>
-          stagedFiles(() =>
-            transaction(() => {
-              batch = postQueue.splice(0);
-              for (const p of batch)
-                try {
-                  p.message = createMessage(
-                    p.roomId,
-                    p.userId,
-                    p.body,
-                    p.clientId,
-                    true,
-                  );
-                } catch (error) {
-                  p.error = error;
-                }
-            }),
-          ),
-        );
-      } catch (error) {
-        for (const p of batch || postQueue.splice(0)) p.reject(error);
-        continue;
-      }
-      for (const p of batch) p.error ? p.reject(p.error) : p.resolve(p.message);
-    }
-  } finally {
-    postFlushing = false;
-  }
 }
 const turbo = (res, action, target, body = "") =>
   res
@@ -584,23 +538,34 @@ export function registerRoutes(app) {
           }
         // Without an attachment the row read inside createMessage is still current.
         const shown = item === null ? message : messageById(message.id),
-          html = fragment("message", messageData([shown])[0]);
-        announceMessage(message, html, room);
+          html = fragment(
+            "message",
+            messageData(
+              [shown],
+              "",
+              item === null ? (createdBody(shown) ?? null) : null,
+            )[0],
+          );
+        // The message is committed: answer first, then broadcast and enqueue
+        // notifications in the same tick.
         if (isBot)
-          return res
+          res
             .status(201)
             .set(
               "Location",
               `${origin(req)}/rooms/${room.id}/messages/${message.id}`,
             )
             .end();
-        if (json) return res.status(201).json(serializeMessage(shown, req));
-        return turbo(
-          res,
-          "append",
-          `messages_rooms_${room.type.split("::").pop().toLowerCase()}_${room.id}`,
-          html,
-        );
+        else if (json) res.status(201).json(serializeMessage(shown, req));
+        else
+          turbo(
+            res,
+            "append",
+            `messages_rooms_${room.type.split("::").pop().toLowerCase()}_${room.id}`,
+            html,
+          );
+        announceMessage(message, html, room);
+        return;
       }
       if (["PATCH", "PUT"].includes(req.method)) {
         const blob = await prepareMessageAttachment({ ...req, user }, item);
