@@ -103,3 +103,38 @@ non-WAL database or with `EPOCH_SHM=0`, the SQL runs as before.
 restarts move the epoch. Limit: this relies on SQLite's documented WAL-index
 layout and on `read()` of the `-shm` file seeing the shared mapping (true on
 Linux and macOS, which share one page cache for both).
+
+## Posting a message (group commit, single writer)
+
+`POST /rooms/:id/messages` without an attachment goes through
+`src/post_writer.js`. Posts that arrive while a write is under way share one
+transaction. The batch first runs with no savepoint at all (inside a
+savepoint SQLite copies each changed page to a sub-journal file first). If any
+statement throws, the whole batch rolls back and runs again with one savepoint
+per post, so only the failing posts get an error. The room `updated_at` and the
+memberships unread `UPDATE` run once per room / (room, creator) at the end of
+the batch, in post order. This gives the same rows as running them once per
+post: a later post of the same creator writes a later time to a superset of the
+rows (its 60 s connection cutoff is later). Every response is sent after the
+shared `COMMIT`.
+
+With `WEB_WORKERS` > 1 the HTTP worker sanitizes the body, computes its search
+text and sends the post over IPC to the primary process, which is the only
+writer for posts (one connection, warm cache, no lock hand-offs, larger
+batches). The primary returns the inserted row; the worker renders, answers and
+then broadcasts and enqueues push/webhook jobs in the same tick. HTTP workers
+do not checkpoint; the primary uses SQLite's automatic checkpoint with a
+10000-page (about 40 MB) WAL threshold. Before this, timer checkpoints never
+caught up with a busy writer and the WAL grew without bound (about 55 MB/s
+under the post benchmark).
+
+`src/fast_post.js` routes these POSTs through the app's own router stack minus
+layers whose path cannot match `/rooms/<digits>/messages` and minus the JSON
+and text body parsers (urlencoded bodies only). Headers, encoding, urlencoded
+parser, method override, session, bans/CSRF, the route, 404 and error handler
+run unchanged. Verified: response headers and bodies equal to the full router
+(identity and gzip), the parity harness (only the known Content-Length vs
+chunked and `/users/2` log text differences), persisted rows equal to the
+reference build except push jobs for non-permitted endpoints, `integrity_check`
+ok and an FTS row for every 200 under load. Limit: a crash of the primary
+between `COMMIT` and the IPC reply loses that reply (the post is stored).

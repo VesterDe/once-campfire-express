@@ -6,6 +6,8 @@ import { createApp, fastPath } from "./app.js";
 import { attachCable, deliver } from "./cable.js";
 import { startWorker, stopWorker } from "./jobs.js";
 import { createFront } from "./netfront.js";
+import "./post_writer.js";
+import { postFastPath } from "./fast_post.js";
 let shuttingDown = false;
 const workers = Number(process.env.WEB_WORKERS || "1");
 if (!Number.isInteger(workers) || workers < 1 || workers > 64)
@@ -28,7 +30,7 @@ if (workers === 1 || cluster.isWorker) {
   const server = http.createServer((req, res) => {
     let done = false;
     try {
-      done = fastPath(app, req, res);
+      done = fastPath(app, req, res) || postFastPath(app, req, res);
     } catch (error) {
       console.error(error);
     }
