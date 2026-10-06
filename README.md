@@ -71,6 +71,9 @@ connection in both runs.
   that is pipelined behind an unanswered request on the same connection can, in rare
   timing, get the page from just before another process's write; a client that waits
   for each response (browsers, the benchmark) always sees the write.
+- The sidebar keeps each user's room list HTML until the next database write by any
+  process. Its gzip answer sends the per-request head and tail as stored (not compressed)
+  deflate blocks, so the compressed size and the `ETag` differ; the decoded HTML is the same.
 - The answer to posting a message (`POST /rooms/:id/messages`) is sent without gzip, also
   when the client accepts gzip (identity is always an acceptable coding). Rails gzips it.
   The body and all other headers are the same; gzip of the ~8 KB turbo stream cost more

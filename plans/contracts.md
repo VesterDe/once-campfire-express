@@ -52,6 +52,22 @@ go through the normal middleware. Verified by decoding with Node zlib, Ruby
 `Zlib::GzipReader` and `curl --compressed` against the uncached code on a
 seeded database before and after boosts, edits, renames and posts.
 
+Sidebar room list (`sidebarState` in `src/routes.js`): the HTML of one user's
+room list (direct and shared rooms, from `sidebarRooms` in
+`src/fast_templates.js`) and the account's room-creation rule are kept per
+user while `epoch()` is unchanged (a write by any process starts a new
+build). The head (signed stream names) and the tail (avatar, new-room button)
+are built for each request. On `not-crazy-perf`, which has no page cache, the
+route sends these three parts through `sendParts` in `src/rendering.js`: the
+room list keeps its own deflate, and the head and tail go out as stored
+(not compressed) deflate blocks, so a sidebar request does no zlib work while
+the epoch is unchanged. Deliberate differences: the gzip bytes are larger
+than before and the `ETag` (a hash of the sent bytes) changes; the decoded
+HTML is the same. Checked: decoded body byte-identical to the earlier code,
+the parity harness (only the expected header differences), and a rename, an
+account setting change and an unread mark written by a second process all
+show up on the next sidebar request.
+
 Raw repeat path (`fastPath` in `src/app.js`): when a hot GET (room, messages
 page, sidebar, search) is answered from the page cache through the normal
 path, the app records the response headers and the derived request state. A
