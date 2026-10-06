@@ -603,8 +603,9 @@ export function createApp() {
   const app = express();
   app.disable("x-powered-by");
   app.set("query parser", "extended");
-  // Express' weak ETag ("etag" package), with a one-shot SHA-1.
-  app.set("etag", (body, encoding) => {
+  // Express' weak ETag ("etag" package), with a one-shot SHA-1. The "etag"
+  // setting stays "weak" (the cached page paths check it).
+  app.set("etag fn", (body, encoding) => {
     const buf = Buffer.isBuffer(body) ? body : Buffer.from(body, encoding);
     return buf.length === 0
       ? 'W/"0-2jmj7l5rSw0yVb/vlWAYkK/YBwk"'
