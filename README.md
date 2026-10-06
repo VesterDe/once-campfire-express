@@ -14,8 +14,8 @@ docker run --rm -p 8080:80 -e SECRET_KEY_BASE="$(openssl rand -hex 64)" \
 
 Existing installs must reuse their `SECRET_KEY_BASE` and mount their storage at
 `/rails/storage`. Preserve VAPID keys for existing push subscriptions. `WEB_WORKERS`
-sets the HTTP process count; publications pass through the primary process to every
-worker. A separate leased SQLite queue handles jobs. TLS terminates at a proxy;
+sets the HTTP process count (default: available CPUs); publications pass through the
+primary process to workers that hold WebSocket connections. A separate leased SQLite queue handles jobs. TLS terminates at a proxy;
 configure `TRUSTED_PROXIES` with its addresses.
 
 For local development, use the pinned Node version, run `npm ci`,
@@ -52,6 +52,8 @@ connection in both runs.
   rebuilding previews as needed. Native-library media bytes can differ.
 - HTML whitespace and malformed-fragment repair can differ. Full byte parity is not claimed.
 - Direct-room autocomplete explicitly requests JSON, repairing the original fetch-header bug.
+- A session cookie re-sent for the same old cookie and same new session within one second is
+  reused, so its embedded expiry can be up to one second older than the response time.
 - Backups require a maintenance window for consistent database and file snapshots. App and
   queue snapshots are separate; external job effects have at-least-once delivery.
 

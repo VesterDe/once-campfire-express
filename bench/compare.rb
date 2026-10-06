@@ -100,9 +100,9 @@ begin
         config["WEB_WORKERS"] ||= "3"
       end
       metadata[:topology] ||= {}
-      metadata[:topology][app] = app == "express" ? {http_workers: config.fetch("WEB_WORKERS", "3"), cable: "native ws with cluster IPC", jobs: "leased auxiliary SQLite"} : app == "django" ? {http_workers: config.fetch("WEB_WORKERS"), cable: "ASGI with isolated Redis", jobs: "leased auxiliary SQLite"} :
+      metadata[:topology][app] = app == "express" ? {http_workers: config.fetch("WEB_WORKERS", "4"), cable: "native ws with cluster IPC", jobs: "leased auxiliary SQLite"} : app == "django" ? {http_workers: config.fetch("WEB_WORKERS"), cable: "ASGI with isolated Redis", jobs: "leased auxiliary SQLite"} :
         app == "laravel" ? {http_workers: 8, http: "nginx/FPM OPcache", cable: "native Workerman", jobs: "auxiliary SQLite queue worker"} : {http_workers: 3, threads: 5, http: "Thruster/Puma", cable: "native Rails", jobs: "native Ruby Redis"}
-      config["WEB_WORKERS"] ||= "3" if app == "express"
+      config["WEB_WORKERS"] ||= "4" if app == "express"
       command = ["docker", "run", "-d", "--name", container, "--network", "host", "--cpuset-cpus", options[:cpus]]
       command.concat environment(config)
       command.concat mounts(File.join(data, "db") => "/rails/storage/db", File.join(data, "files") => "/rails/storage/files", File.join(data, "logs") => "/rails/storage/logs")
