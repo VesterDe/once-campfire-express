@@ -6,9 +6,8 @@ import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 const temp = mkdtempSync(join(tmpdir(), "campfire-express-epoch-"));
 process.env.CAMPFIRE_STORAGE_PATH = temp;
-const { initialize, epoch, turnEpoch, run, transaction } = await import(
-  "../src/db.js"
-);
+const { initialize, epoch, turnEpoch, run, transaction } =
+  await import("../src/db.js");
 after(() => rmSync(temp, { recursive: true, force: true }));
 // epoch() skips its SQL while the -shm wal-index header is unchanged; every
 // commit, from this connection or another one, and every checkpoint+restart
