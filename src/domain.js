@@ -9,7 +9,7 @@ import {
 } from "./richtext.js";
 import { publish, publishable } from "./cable.js";
 import { stream } from "./rails.js";
-import { fragment, messageData } from "./rendering.js";
+import { fragment, messageData, cachedRows } from "./rendering.js";
 import { enqueue, enqueueMany, permittedPushEndpoint } from "./jobs.js";
 export const userById = (id) =>
   get("SELECT * FROM users WHERE id=?", Number(id));
@@ -41,7 +41,20 @@ export function messagesByIds(ids) {
 }
 // Sanitized body of messages created in this process, so notifyMessage skips a re-read.
 const createdContent = new WeakMap();
-export function messagesForRoom(id, { before, after, around } = {}) {
+// The rows are kept per query until the db epoch moves (rendering.js
+// cachedRows); the list and its rows are frozen.
+const plainArg = (v) =>
+  v === undefined || typeof v === "string" || typeof v === "number";
+export function messagesForRoom(id, query = {}) {
+  const { before, after, around } = query;
+  if (!plainArg(before) || !plainArg(after) || !plainArg(around))
+    return roomMessages(id, query);
+  return cachedRows(
+    `${Number(id)}|${before ?? ""}|${after ?? ""}|${around ?? ""}`,
+    () => roomMessages(id, query),
+  );
+}
+function roomMessages(id, { before, after, around } = {}) {
   if (around) {
     const pivot = get(
       "SELECT * FROM messages WHERE id=? AND room_id=?",
