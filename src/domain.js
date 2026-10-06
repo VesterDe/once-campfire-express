@@ -356,10 +356,24 @@ export const roomMembers = (roomId) =>
 export const createdBody = (message) => createdContent.get(message);
 export const rememberCreated = (message, content) =>
   createdContent.set(message, content);
+// Members and push-subscribed users of a room as the post writer read them
+// inside the commit of the post (see post_writer.js): the HTTP worker then
+// does not read them again from a page cache the commit just invalidated.
+const createdAudience = new WeakMap();
+export const rememberAudience = (message, audience) =>
+  createdAudience.set(message, audience);
+export const roomAudience = (roomId) => ({
+  members: all(
+    "SELECT m.user_id,m.involvement,m.connected_at,u.role,u.status FROM memberships m LEFT JOIN users u ON u.id=m.user_id WHERE m.room_id=?",
+    Number(roomId),
+  ),
+  pushable: [...pushableUsers(Number(roomId))],
+});
 export function announceMessage(message, html, room) {
-  const members = roomMembers(room.id);
+  const a = createdAudience.get(message);
+  const members = a ? a.members : roomMembers(room.id);
   publishMessage(message, "append", html, room, members);
-  notifyMessage(message, {}, room, members);
+  notifyMessage(message, {}, room, members, a ? new Set(a.pushable) : null);
 }
 function pushableUsers(roomId) {
   const users = new Set();
@@ -375,6 +389,7 @@ export function notifyMessage(
   { webhooks = true } = {},
   knownRoom = null,
   members = null,
+  knownPushable = null,
 ) {
   const content = createdContent.get(message);
   const body =
@@ -391,7 +406,7 @@ export function notifyMessage(
     room = knownRoom || get("SELECT * FROM rooms WHERE id=?", message.room_id);
   const jobs = [];
   // A push job only for users with a subscription Rails would deliver to.
-  let pushable = null;
+  let pushable = knownPushable;
   for (const m of members ||
     all(
       "SELECT m.*,u.role,u.status FROM memberships m JOIN users u ON u.id=m.user_id WHERE m.room_id=? AND m.user_id<>?",
