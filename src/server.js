@@ -5,6 +5,7 @@ import { initialize } from "./db.js";
 import { createApp, fastPath } from "./app.js";
 import { attachCable, deliver } from "./cable.js";
 import { startWorker, stopWorker } from "./jobs.js";
+import { createFront } from "./netfront.js";
 let shuttingDown = false;
 const workers = Number(process.env.WEB_WORKERS || "1");
 if (!Number.isInteger(workers) || workers < 1 || workers > 64)
@@ -34,7 +35,10 @@ if (workers === 1 || cluster.isWorker) {
     if (!done) app(req, res);
   });
   attachCable(server);
-  server.listen(
+  // NET_FRONT=0 listens with node:http directly (no net front).
+  const front = process.env.NET_FRONT === "0" ? server : createFront(server);
+  if (front !== server) front.on("listening", () => server.emit("listening"));
+  front.listen(
     Number(process.env.HTTP_PORT || 8080),
     process.env.BIND || "0.0.0.0",
     () =>
@@ -43,6 +47,7 @@ if (workers === 1 || cluster.isWorker) {
       ),
   );
   const close = () => {
+    if (front !== server) front.close();
     server.close();
     setTimeout(() => process.exit(0), 5000).unref();
   };

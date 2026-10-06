@@ -71,6 +71,27 @@ other case use the normal path. `test/raw_fast.test.js` compares status,
 header order and values (except `Date`, the CSRF-dependent `ETag` part and
 the `Expires` second) and decoded bodies of both paths.
 
+Net front (`src/netfront.js`, on unless `NET_FRONT=0`): the worker listens
+with a plain `net.Server`. Each new connection starts there. A complete
+`GET ... HTTP/1.1` head with plain `Name: value` header lines (no body
+headers, no `Upgrade`, no `Expect`, `Connection` only as `keep-alive`) is
+looked up with the same raw repeat match and the same validity checks; a hit
+is written as one Buffer that is byte-identical to what node:http writes for
+the raw repeat path (headers, then `Date`, `Connection: keep-alive`,
+`Keep-Alive: timeout=N`, then body). Several hits pipelined in one TCP read
+share one `epoch()` read (same synchronous run, nothing else can commit in
+between). On the first request that is not such a hit, the unread bytes are
+put back on the socket and the socket is handed to the node:http server for
+the rest of its life (so the miss still records an entry, and WebSocket
+upgrades, POSTs, HTTP/1.0 and `Connection: close` behave as before). Limits:
+idle front sockets close after `keepAliveTimeout`, but node:http's
+`headersTimeout`/`requestTimeout` only apply after hand-off; a partial head
+larger than 16 KiB is handed off. `test/net_front.test.js` checks hits,
+byte equality with node:http in the same second, keep-alive, split and
+pipelined heads, miss hand-off, `Connection: close`, HTTP/1.0, POST and the
+cable WebSocket. The parity harness runs with a frozen clock, so there it
+only exercises the hand-off path.
+
 `epoch()` first reads the 96-byte WAL-index header at the start of the
 `-shm` file. Every commit by any connection (this one included) and every WAL
 restart rewrites that header (change counter, frame count, salts, checksums;

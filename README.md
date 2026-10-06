@@ -59,6 +59,11 @@ connection in both runs.
   mask (and the ETag) is the same for every such repeat in that second. Rails masks the token
   again on every request. The masked token is still valid for that session; only the
   per-request BREACH re-masking is weaker within that second.
+- Workers accept connections with a plain `net.Server` (set `NET_FRONT=0` to use node:http
+  directly). It answers raw repeat hits itself with the same bytes node:http would send and
+  hands every other connection to node:http at its first non-hit request. Before that
+  hand-off, node:http's header and request timeouts do not apply; an idle socket still
+  closes after the keep-alive timeout.
 - Backups require a maintenance window for consistent database and file snapshots. App and
   queue snapshots are separate; external job effects have at-least-once delivery.
 
