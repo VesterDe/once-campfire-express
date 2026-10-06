@@ -13,7 +13,20 @@ import { registerPublic } from "./public.js";
 import { registerOpengraph } from "./opengraph.js";
 import { allowLogin } from "./rate_limit.js";
 
+// The same Cookie header repeats on every request of a client: keep the parsed
+// pairs per header string and hand out a fresh copy (also keeps the decoded
+// value strings identical, so later Map lookups reuse their hash).
+const parsedCookies = new Map();
 export function parseCookies(header = "") {
+  let hit = parsedCookies.get(header);
+  if (hit === undefined) {
+    hit = parseCookieHeader(header);
+    if (parsedCookies.size >= 1000) parsedCookies.clear();
+    parsedCookies.set(header, hit);
+  }
+  return Object.assign(Object.create(null), hit);
+}
+function parseCookieHeader(header) {
   const result = Object.create(null);
   for (const item of header.split(";")) {
     const i = item.indexOf("=");
@@ -76,6 +89,35 @@ function lookupSession(token) {
   session.status = user.status;
   return [session, user];
 }
+// The last_room Set-Cookie text, built exactly as res.cookie() would (same
+// cookie package and options) and reused while its Expires second is the same.
+const cookieLib = createRequire(
+  createRequire(import.meta.url).resolve("express"),
+)("cookie");
+const COOKIE_MAX_AGE = 20 * 365 * 86400 * 1000;
+const lastRoomCookies = new Map();
+function lastRoomCookie(value, secure) {
+  const expires = Date.now() + COOKIE_MAX_AGE;
+  const second = Math.floor(expires / 1000);
+  const key = (secure ? "s" : "-") + value;
+  let hit = lastRoomCookies.get(key);
+  if (hit === undefined || hit.second !== second) {
+    hit = {
+      second,
+      text: cookieLib.serialize("last_room", value, {
+        httpOnly: false,
+        sameSite: "lax",
+        secure,
+        maxAge: Math.floor(COOKIE_MAX_AGE / 1000),
+        path: "/",
+        expires: new Date(expires),
+      }),
+    };
+    if (lastRoomCookies.size >= 1000) lastRoomCookies.clear();
+    lastRoomCookies.set(key, hit);
+  }
+  return hit.text;
+}
 // Process-local copies of rarely changing rows, dropped when epoch() moves.
 let cachedEpoch = null,
   cachedAccount,
@@ -94,15 +136,19 @@ function refreshCaches(e) {
 function sessionMiddleware(req, res, next) {
   req.cookies = parseCookies(req.headers.cookie);
   req.session = {};
+  let before = "{}";
   try {
-    const session = rails.decryptCookieCached(
+    const json = rails.decryptCookieCachedJSON(
       "_campfire_session",
       req.cookies._campfire_session,
     );
-    if (session && typeof session === "object" && !Array.isArray(session))
-      req.session = session;
+    // json is stringify() of the decrypted value, so for an object it is
+    // already stringify(req.session) before any change.
+    if (json !== undefined && json[0] === "{") {
+      req.session = rails.parseJSON(json);
+      before = json;
+    }
   } catch {}
-  const before = rails.stringify(req.session);
   try {
     if (rails.decode64(req.session._csrf_token).length !== 32)
       delete req.session._csrf_token;
@@ -176,10 +222,10 @@ function sessionMiddleware(req, res, next) {
         options,
       );
     if (req.lastRoom !== undefined)
-      res.cookie("last_room", String(req.lastRoom), {
-        ...options,
-        httpOnly: false,
-      });
+      this.append(
+        "Set-Cookie",
+        lastRoomCookie(String(req.lastRoom), options.secure),
+      );
     return writeHead.apply(this, args);
   };
   next();

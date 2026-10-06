@@ -26,10 +26,18 @@ export const parseJSON = (text) =>
           ? BigInt(context.source)
           : v,
       );
-export const stringify = (value) =>
-  JSON.stringify(value, (k, v) =>
-    typeof v === "bigint" ? JSON.rawJSON(v.toString()) : v,
-  );
+// Plain JSON.stringify throws on a BigInt (no toJSON); only then is the
+// slower replacer needed. Both give the same text for BigInt-free values.
+const bigintJSON = (k, v) =>
+  typeof v === "bigint" ? JSON.rawJSON(v.toString()) : v;
+export function stringify(value) {
+  try {
+    return JSON.stringify(value);
+  } catch (error) {
+    if (!(error instanceof TypeError)) throw error;
+    return JSON.stringify(value, bigintJSON);
+  }
+}
 export const encode = (value) =>
   Buffer.from(
     stringify(value).replace(
@@ -281,11 +289,14 @@ function cookieValue(raw, name, meta) {
 }
 // Cookie strings repeat on every request: cache the verified/decrypted
 // payload by raw string. Expiry is checked again on each hit and every hit
-// returns a fresh copy, because handlers mutate the session.
+// returns a fresh copy, because handlers mutate the session. One map per
+// kind and name, keyed by the raw string itself (no long concatenated key).
 const cookieCache = new Map();
-function cachedCookie(kind, name, raw) {
-  const id = kind + "\0" + name + "\0" + raw;
-  let e = cookieCache.get(id);
+let cookieCacheSize = 0;
+function cachedEntry(kind, name, raw) {
+  let byRaw = cookieCache.get(kind + name);
+  if (byRaw === undefined) cookieCache.set(kind + name, (byRaw = new Map()));
+  let e = byRaw.get(raw);
   if (e === undefined || e.secret !== process.env.SECRET_KEY_BASE) {
     const meta = { exp: null };
     e = { secret: process.env.SECRET_KEY_BASE, exp: null };
@@ -297,13 +308,21 @@ function cachedCookie(kind, name, raw) {
     } catch (error) {
       e.error = error;
     }
-    if (cookieCache.size >= 10000) cookieCache.clear();
-    cookieCache.set(id, e);
+    if (cookieCacheSize >= 10000) {
+      for (const m of cookieCache.values()) m.clear();
+      cookieCacheSize = 0;
+    }
+    if (!byRaw.has(raw)) cookieCacheSize++;
+    byRaw.set(raw, e);
   }
   if (e.error) throw e.error;
   if (e.exp !== null && !(e.exp > clock().getTime()))
     throw new Error("expired cookie");
-  return e.json === undefined ? undefined : parseJSON(e.json);
+  return e.json;
+}
+function cachedCookie(kind, name, raw) {
+  const json = cachedEntry(kind, name, raw);
+  return json === undefined ? undefined : parseJSON(json);
 }
 export const verifyCookieCached = (name, raw) =>
   typeof raw === "string"
@@ -313,6 +332,12 @@ export const decryptCookieCached = (name, raw) =>
   typeof raw === "string"
     ? cachedCookie("e", name, raw)
     : decryptCookie(name, raw);
+// The decrypted value as its stringify() text (undefined when the payload is
+// JSON null-ish); same checks and errors as decryptCookieCached.
+export const decryptCookieCachedJSON = (name, raw) =>
+  typeof raw === "string"
+    ? cachedEntry("e", name, raw)
+    : stringify(decryptCookie(name, raw));
 export function verifyCookie(name, raw, meta) {
   raw = decodeURIComponent(raw);
   const i = raw.lastIndexOf("--");
