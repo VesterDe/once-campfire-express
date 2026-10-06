@@ -66,6 +66,30 @@ token gets the ETag `W/"<length>-<boot id><page id><kind>.<CRC-32 of the
 token>"` (no SHA-1 per request); it still changes whenever the body does,
 except for a 1 in 2^32 chance between two tokens on the same page.
 
+Sidebar room list (`sidebarState` in `src/routes.js`): the HTML of one user's
+room list (direct and shared rooms, from `sidebarRooms` in
+`src/fast_templates.js`) and the account's room-creation rule are kept per
+user while `epoch()` is unchanged (a write by any process starts a new
+build). The head (signed stream names) and the tail (avatar, new-room button)
+are built for each request. On `not-crazy-perf`, which has no page cache, the
+route sends these three parts through `sendParts` in `src/rendering.js`: the
+room list keeps its own deflate, and the head and tail go out as stored
+(not compressed) deflate blocks, so a sidebar request does no zlib work while
+the epoch is unchanged. Deliberate differences: the gzip bytes are larger
+than before and the `ETag` (a hash of the sent bytes) changes; the decoded
+HTML is the same. Checked: decoded body byte-identical to the earlier code,
+the parity harness (only the expected header differences), and a rename, an
+account setting change and an unread mark written by a second process all
+show up on the next sidebar request.
+
+Search data cache (`registerSearch` in `src/routes.js`): the result rows and
+the recent-search list for one (user id, cleaned query) are kept per process
+under the `epoch()` read before the queries, at most 256 entries, and dropped
+when `epoch()` moves. It holds database rows only; the page is still rendered
+per request (also on not-crazy-perf, which has no page cache). Rows are not
+changed after they are read. GET `/searches` writes nothing, as in Rails (only
+POST records a search), so repeat searches stay warm until some write.
+
 Raw repeat path (`fastPath` in `src/app.js`): when a hot GET (room, messages
 page, sidebar, search) is answered from the page cache through the normal
 path, the app records the response headers and the derived request state. A

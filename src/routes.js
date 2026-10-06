@@ -49,6 +49,57 @@ import {
   purgeBlob,
 } from "./storage.js";
 import { enqueue } from "./jobs.js";
+import { sidebarRooms } from "./fast_templates.js";
+// The sidebar room list (HTML) and the account's room rule for one user, kept
+// while the database epoch is unchanged. A write by any process changes the
+// epoch, so the next request builds them again.
+const sidebarStates = new Map();
+function sidebarState(user) {
+  const ep = cacheEpoch();
+  const hit = sidebarStates.get(user.id);
+  if (hit && hit.ep === ep && ep !== -1 && hit.updated === user.updated_at)
+    return hit;
+  const rooms = roomsForUser(user.id).filter(
+    (r) => r.involvement !== "invisible",
+  );
+  rooms.sort((a, b) =>
+    a.type === "Rooms::Direct" && b.type === "Rooms::Direct"
+      ? b.updated_at.localeCompare(a.updated_at)
+      : a.type === "Rooms::Direct"
+        ? -1
+        : b.type === "Rooms::Direct"
+          ? 1
+          : (a.name || "").localeCompare(b.name || ""),
+  );
+  const members = directMembers(
+    rooms.filter((r) => r.type === "Rooms::Direct").map((r) => r.id),
+  );
+  let settings = {};
+  try {
+    settings = JSON.parse(
+      get("SELECT settings FROM accounts LIMIT 1")?.settings || "{}",
+    );
+  } catch {}
+  const mid = sidebarRooms({
+    SidebarRooms: rooms.map((r) => ({
+      ...roomData(r, user, members),
+      Unread: !!r.unread_at,
+    })),
+    Placeholders: [],
+  });
+  const state = {
+    ep,
+    updated: user.updated_at,
+    mid,
+    piece: null,
+    restrict: !!settings.restrict_room_creation_to_administrators,
+  };
+  if (ep !== -1 && cacheEpoch() === ep) {
+    if (sidebarStates.size >= 1000) sidebarStates.clear();
+    sidebarStates.set(user.id, state);
+  }
+  return state;
+}
 const token = () => randomBytes(18).toString("base64url");
 const origin = (req) => `${req.protocol}://${req.get("host")}`;
 export function value(req, group, key, fallback = "") {
@@ -385,27 +436,10 @@ export function registerRoutes(app) {
   });
   app.get(["/users/me/sidebar", "/users/:id/sidebar"], login, (req, res) => {
     sendPage(req, res, "sidebar", cacheEpoch(), "", () => {
-      const rooms = roomsForUser(req.user.id).filter(
-        (r) => r.involvement !== "invisible",
-      );
-      rooms.sort((a, b) =>
-        a.type === "Rooms::Direct" && b.type === "Rooms::Direct"
-          ? b.updated_at.localeCompare(a.updated_at)
-          : a.type === "Rooms::Direct"
-            ? -1
-            : b.type === "Rooms::Direct"
-              ? 1
-              : (a.name || "").localeCompare(b.name || ""),
-      );
-      const members = directMembers(
-        rooms.filter((r) => r.type === "Rooms::Direct").map((r) => r.id),
-      );
+      const s = sidebarState(req.user);
       return {
-        SidebarRooms: rooms.map((r) => ({
-          ...roomData(r, req.user, members),
-          Unread: !!r.unread_at,
-        })),
-        Placeholders: [],
+        SidebarMid: s.mid,
+        CanCreateRooms: req.user.role === 1 || !s.restrict,
       };
     });
   });
@@ -1313,29 +1347,53 @@ function registerSearch(app) {
       }
       return res.redirect("/searches?" + new URLSearchParams({ q: query }));
     }
-    sendPage(req, res, "search", cacheEpoch(), query, () => {
-      let rows = [];
-      if (query) {
-        const ids = all(
-          "SELECT m.id FROM messages m JOIN message_search_index idx ON idx.rowid=m.id JOIN memberships ms ON ms.room_id=m.room_id WHERE ms.user_id=? AND idx.body MATCH ? ORDER BY m.created_at DESC LIMIT 100",
-          req.user.id,
-          query
-            .split(/\s+/)
-            .map((word) => '"' + word.replaceAll('"', '""') + '"')
-            .join(" "),
-        ).map((r) => r.id);
-        rows = messagesByIds(ids).sort((a, b) =>
-          a.created_at.localeCompare(b.created_at),
-        );
+    const ep = cacheEpoch();
+    sendPage(req, res, "search", ep, query, () => {
+      // Rows only (not the page): reused while no process has written,
+      // because any write changes the epoch.
+      const key = req.user.id + "\n" + query;
+      if (ep !== searchEpoch) {
+        searchCache.clear();
+        searchEpoch = ep;
+      }
+      let found = ep !== -1 && ep != null && searchCache.get(key);
+      if (!found) {
+        found = searchData(req.user.id, query);
+        if (ep !== -1 && ep != null && cacheEpoch() === ep) {
+          if (searchCache.size >= SEARCH_CAP)
+            searchCache.delete(searchCache.keys().next().value);
+          searchCache.set(key, found);
+        }
       }
       return {
-        MessageRows: rows,
+        MessageRows: found.rows,
         Query: query,
-        RecentSearches: all(
-          "SELECT query FROM searches WHERE user_id=? ORDER BY updated_at DESC LIMIT 10",
-          req.user.id,
-        ).map((s) => s.query),
+        RecentSearches: found.recent,
       };
     });
   });
+}
+const SEARCH_CAP = 256;
+const searchCache = new Map();
+let searchEpoch = null;
+function searchData(userId, query) {
+  let rows = [];
+  if (query) {
+    const ids = all(
+      "SELECT m.id FROM messages m JOIN message_search_index idx ON idx.rowid=m.id JOIN memberships ms ON ms.room_id=m.room_id WHERE ms.user_id=? AND idx.body MATCH ? ORDER BY m.created_at DESC LIMIT 100",
+      userId,
+      query
+        .split(/\s+/)
+        .map((word) => '"' + word.replaceAll('"', '""') + '"')
+        .join(" "),
+    ).map((r) => r.id);
+    rows = messagesByIds(ids).sort((a, b) =>
+      a.created_at.localeCompare(b.created_at),
+    );
+  }
+  const recent = all(
+    "SELECT query FROM searches WHERE user_id=? ORDER BY updated_at DESC LIMIT 10",
+    userId,
+  ).map((s) => s.query);
+  return { rows, recent };
 }

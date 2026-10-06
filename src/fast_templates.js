@@ -193,7 +193,10 @@ export function sidebarDirect(d) {
   return `<a class="direct${d.Unread ? " unread" : ""}" id="${e(d.DOM("list"))}" data-sorted-list-number="${e(epoch(d.UpdatedAt))}" data-rooms-list-target="room" data-badge-dot-target="unread" data-sorted-list-target="item" data-room-id="${id}" href="/rooms/${id}">${avatars}<span class="direct__author flex align-center gap max-width min-width border-radius txt-small"><span class="txt-nowrap overflow-ellipsis"><span class="for-screen-reader">Ping with</span>${e(d.Label)}</span></span></a>`;
 }
 
-export function sidebar(d) {
+// The sidebar is cut in three: the head and tail hold the per-user stream
+// names and avatar, the middle holds the room list. The sidebar route keeps
+// the middle per user while the database epoch is unchanged.
+export function sidebarRooms(d) {
   const rooms = d.SidebarRooms || [];
   let directs = "",
     shared = "",
@@ -205,14 +208,23 @@ export function sidebar(d) {
   }
   for (const p of d.Placeholders || [])
     placeholders += `<form class="button_to" method="post" action="/rooms/directs?user_ids%5B%5D=${e(p.ID)}"><button class="direct borderless fill-transparent unpad"><span class="avatar"><img src="${avatar(p.ID, p.UpdatedAt)}" aria-hidden="true"></span><span class="direct__author flex align-center gap max-width min-width border-radius txt-small"><span class="txt-nowrap overflow-ellipsis"><span class="for-screen-reader">Start a ping with</span>${e((p.Name || "").split(" ")[0])}</span></span></button></form>`;
-  const uid = e(d.User?.ID);
+  return `${directs}</div><div contents>${placeholders}</div></div></turbo-frame>
+<div class="rooms position-relative flex flex-column gap"><div id="shared_rooms" contents data-controller="sorted-list">${shared}</div>`;
+}
+export function sidebarHead(d) {
   return `<turbo-frame id="user_sidebar" data-turbo-permanent="true" target="_top" data-controller="rooms-list read-rooms turbo-frame" data-rooms-list-unread-class="unread" data-action="presence:present@window->rooms-list#read read-rooms:read->rooms-list#read turbo:frame-load->rooms-list#loaded refresh-room:visible@window->turbo-frame#reload">
 <turbo-cable-stream-source channel="Turbo::StreamsChannel" signed-stream-name="${e(d.RoomsStream)}"></turbo-cable-stream-source><turbo-cable-stream-source channel="Turbo::StreamsChannel" signed-stream-name="${e(d.UserRoomsStream)}"></turbo-cable-stream-source>
 <div class="sidebar__container overflow-y overflow-hide-scrollbar" data-controller="badge-dot" data-badge-dot-unread-class="unread" data-action="rooms-list:unread@window->badge-dot#update rooms-list:read@window->badge-dot#update turbo:submit-start->turbo-frame#unpermanize">
-<turbo-frame id="direct_rooms_control" target="_top"><div class="directs gap overflow-x overflow-hide-scrollbar"><a class="direct direct__new" data-turbo-frame="_self" href="/rooms/directs/new"><span class="avatar avatar--icon"><img src="${A("messages-add.svg")}" width="20" height="20" aria-hidden="true" class="colorize--black"></span><span class="direct__author flex max-width min-width border-radius pad-inline-half"><span class="for-screen-reader">New</span><span class="txt-small overflow-clip">Ping</span></span></a><div id="direct_rooms" contents data-controller="sorted-list" data-action="rooms-list:unread@window->sorted-list#updateItem">${directs}</div><div contents>${placeholders}</div></div></turbo-frame>
-<div class="rooms position-relative flex flex-column gap"><div id="shared_rooms" contents data-controller="sorted-list">${shared}</div>${d.CanCreateRooms ? `<a class="rooms__new-btn btn room align-center gap txt-reversed" aria-label="New Chat Room" href="/rooms/opens/new"><img src="${A("add.svg")}" width="20" height="20" aria-hidden="true" style="view-transition-name: new-room"></a>` : ""}</div>
+<turbo-frame id="direct_rooms_control" target="_top"><div class="directs gap overflow-x overflow-hide-scrollbar"><a class="direct direct__new" data-turbo-frame="_self" href="/rooms/directs/new"><span class="avatar avatar--icon"><img src="${A("messages-add.svg")}" width="20" height="20" aria-hidden="true" class="colorize--black"></span><span class="direct__author flex max-width min-width border-radius pad-inline-half"><span class="for-screen-reader">New</span><span class="txt-small overflow-clip">Ping</span></span></a><div id="direct_rooms" contents data-controller="sorted-list" data-action="rooms-list:unread@window->sorted-list#updateItem">`;
+}
+export function sidebarTail(d) {
+  const uid = e(d.User?.ID);
+  return `${d.CanCreateRooms ? `<a class="rooms__new-btn btn room align-center gap txt-reversed" aria-label="New Chat Room" href="/rooms/opens/new"><img src="${A("add.svg")}" width="20" height="20" aria-hidden="true" style="view-transition-name: new-room"></a>` : ""}</div>
 <button class="btn sidebar__toggle" data-action="toggle-class#toggle"><img src="${A("menu.svg")}" width="20" height="20" aria-hidden="true"><span class="for-screen-reader">Open menu</span></button></div>
 <div class="flex align-end sidebar__tools gap justify-end"><a class="btn avatar flex-item-no-shrink sidebar__tool" href="/users/me/profile"><img src="${avatar(d.User?.ID, d.User?.UpdatedAt)}" width="48" height="48" aria-hidden="true" style="view-transition-name: avatar-${uid}"><span class="for-screen-reader">My Settings</span></a><a class="btn align-center gap txt-reversed sidebar__tool" href="/account/edit"><img src="${A("settings.svg")}" width="20" height="20" aria-hidden="true" style="view-transition-name: account-settings"><span class="for-screen-reader">Account Settings</span></a></div></turbo-frame>`;
+}
+export function sidebar(d) {
+  return sidebarHead(d) + (d.SidebarMid ?? sidebarRooms(d)) + sidebarTail(d);
 }
 
 /* -------------------------------------------------------------- room page */
@@ -476,6 +488,37 @@ ${d.Invitation ? call("room_invitation", d) : ""}${messagesHTML ?? messages(d)}<
 </div>${layoutEnd(d)}`;
 }
 
+// Search page macros (search, search_nav, recent_searches, search_composer).
+// `{% if list %}` in nunjucks is JS truthiness, so an empty array is true.
+function recentSearches(d) {
+  const list = d.RecentSearches;
+  let out = "";
+  if (list)
+    for (let i = 0; i < list.length; i++) {
+      const q = e(list[i]);
+      out += `<a class="align-center gap room btn txt-nowrap" href="/searches?q=${q}"><span class="overflow-ellipsis">“${q}”</span></a>`;
+    }
+  if (list)
+    out += `<form class="button_to" method="post" action="/searches/clear"><input type="hidden" name="_method" value="delete"><button class="btn searches__btn" data-turbo-confirm="Are you sure you want to clear your recent searches?" type="submit"><img aria-hidden="true" src="${A("broom.svg")}"><span class="for-screen-reader">Clear recent searches</span></button></form>`;
+  return out;
+}
+function searchNav(d) {
+  const head = d.Query
+    ? `<div class="searches__query flex align-center gap pad-block-start-half"><div class="btn btn--reversed btn--faux align-center gap txt-nowrap"><span class="overflow-ellipsis">“${e(d.Query)}”</span><span class="flex-item-no-shrink">${len(d.Messages)}</span></div></div>`
+    : "";
+  return `${head}<div class="searches__recents align-center gap pad-block-half overflow-y overflow-hide-scrollbar">${recentSearches(d)}</div>`;
+}
+function searchComposer(d) {
+  return `<div class="composer flex align-end gap"><a class="btn flex-item-no-shrink margin-block-end" style="view-transition-name: input-switcher; --btn-border-radius: 0.5em" href="/rooms/${e(d.ReturnRoom)}"><img aria-hidden="true" src="${A("arrow-left.svg")}"><span class="for-screen-reader">Exit search</span></a><form class="margin-block flex-item-grow contain flex align-center gap" data-controller="form" data-action="keydown.esc-&gt;form#cancel" action="/searches" accept-charset="UTF-8" method="post"><div class="composer__input flex align-center flex-item-grow gap full-width input input--actor min-width"><img aria-hidden="true" class="composer__input-hint colorize--black" style="view-transition-name: input-btn" src="${A("search.svg")}" width="20" height="20"><input value="${e(d.Query)}" class="searches__input input flex-item-grow" role="searchbox" aria-label="search" autofocus required type="text" name="q" id="q"><a data-form-target="cancel" role="button" class="searches__reset" href="/searches"><img aria-hidden="true" class="colorize--black" src="${A("remove.svg")}" width="14" height="14"><span class="for-screen-reader">Clear search field</span></a><button name="button" type="submit" class="btn btn--reversed flex-item-no-shrink txt-small" style="--btn-border-radius: 0.5em"><img aria-hidden="true" src="${A("arrow-up.svg")}"><span class="for-screen-reader">Search</span></button></div></form></div>`;
+}
+function search(d) {
+  return `${layoutStart(d)}
+<div id="message-area" class="message-area">
+  <div class="message-area--empty min-width center"><figure class="center pad"><img aria-hidden="true" class="colorize--black translucent" src="${A("search.svg")}"></figure></div>
+  <div id="search-results" class="messages searches__results" data-controller="search-results" data-search-results-target="messages" data-search-results-me-class="message--me" data-search-results-threaded-class="message--threaded" data-search-results-mentioned-class="message--mentioned" data-search-results-formatted-class="message--formatted">${messages(d)}</div>
+</div>${layoutEnd(d)}`;
+}
+
 // Name used by fragment(name) -> fast builder, for the macros covered here.
 export const fast = {
   message,
@@ -497,4 +540,8 @@ export const fast = {
   notification_bell: notificationBell,
   layout_start: layoutStart,
   layout_end: layoutEnd,
+  search,
+  search_nav: searchNav,
+  recent_searches: recentSearches,
+  search_composer: searchComposer,
 };
