@@ -1,6 +1,6 @@
 import { DatabaseSync } from "node:sqlite";
 import cluster from "node:cluster";
-import { mkdirSync, readFileSync } from "node:fs";
+import { mkdirSync, readFileSync, openSync, readSync } from "node:fs";
 import { dirname, resolve, join } from "node:path";
 let connection,
   depth = 0;
@@ -37,6 +37,16 @@ export function initialize(
   connection.exec(
     "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA journal_size_limit=67108864; PRAGMA mmap_size=134217728;",
   );
+  shmFd = null;
+  if (path !== ":memory:" && process.env.EPOCH_SHM !== "0")
+    try {
+      if (
+        connection.prepare("PRAGMA journal_mode").get().journal_mode === "wal"
+      )
+        shmFd = openSync(resolve(path) + "-shm", "r");
+    } catch {
+      shmFd = null;
+    }
   // HTTP workers never checkpoint inside a request; the primary does it on a timer.
   // With several workers the primary is the writer for posts (post_writer.js), so it
   // never checkpoints either: each HTTP worker runs a PASSIVE checkpoint on its own
@@ -67,8 +77,35 @@ export function stmt(sql) {
 let epochValue = 0,
   lastVersion = -1,
   lastChanges = -1;
+// In WAL mode every commit (by any connection, ours included) and every WAL
+// restart rewrites the wal-index header at the start of the -shm file: two
+// 48-byte copies, copy 1 written before copy 0. If both copies are equal and
+// byte-identical to the header read before the last SQL check, no commit can
+// have happened since that check, so the epoch has not moved. Anything else
+// (copies differ, header not initialised, read error) takes the SQL check.
+let shmFd = null,
+  shmGood = false;
+const shmNow = Buffer.alloc(96),
+  shmSeen = Buffer.alloc(96);
+function shmRead() {
+  try {
+    return (
+      readSync(shmFd, shmNow, 0, 96, 0) === 96 &&
+      shmNow[12] === 1 &&
+      shmNow.compare(shmNow, 48, 96, 0, 48) === 0
+    );
+  } catch {
+    return false;
+  }
+}
 export function epoch() {
   if (depth) return -1;
+  if (shmFd !== null) {
+    const ok = shmRead();
+    if (ok && shmGood && shmNow.equals(shmSeen)) return epochValue;
+    shmGood = ok;
+    if (ok) shmNow.copy(shmSeen);
+  }
   const v = stmt(
     "SELECT (SELECT data_version FROM pragma_data_version) AS v, total_changes() AS c",
   ).get();

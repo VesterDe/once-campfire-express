@@ -450,13 +450,15 @@ export function registerRoutes(app) {
         }
         if (!json && !message) {
           const { before, after, around } = req.query;
-          return sendMessages(
-            req,
-            res,
-            cacheEpoch(),
-            room.id + "|" + JSON.stringify([before, after, around]),
-            () => messagesForRoom(room.id, req.query),
-          ) || res.sendStatus(204);
+          return (
+            sendMessages(
+              req,
+              res,
+              cacheEpoch(),
+              room.id + "|" + JSON.stringify([before, after, around]),
+              () => messagesForRoom(room.id, req.query),
+            ) || res.sendStatus(204)
+          );
         }
         const rows = message ? [message] : messagesForRoom(room.id, req.query);
         if (!rows.length) return res.sendStatus(204);
@@ -514,25 +516,26 @@ export function registerRoutes(app) {
             body,
             value(req, "message", "client_message_id") || null,
           );
-        else try {
-          await writeTransaction(() =>
-            stagedFiles(() =>
-              transaction(() => {
-                message = createMessage(
-                  room.id,
-                  user.id,
-                  body,
-                  value(req, "message", "client_message_id") || null,
-                  true,
-                );
-                attachMessage(message, item, blob);
-              }),
-            ),
-          );
-        } catch (error) {
-          cleanupPrepared(blob);
-          throw error;
-        }
+        else
+          try {
+            await writeTransaction(() =>
+              stagedFiles(() =>
+                transaction(() => {
+                  message = createMessage(
+                    room.id,
+                    user.id,
+                    body,
+                    value(req, "message", "client_message_id") || null,
+                    true,
+                  );
+                  attachMessage(message, item, blob);
+                }),
+              ),
+            );
+          } catch (error) {
+            cleanupPrepared(blob);
+            throw error;
+          }
         // Without an attachment the row read inside createMessage is still current.
         const shown = item === null ? message : messageById(message.id),
           html = fragment(
