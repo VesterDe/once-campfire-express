@@ -328,10 +328,10 @@ export function fastPath(app, req, res) {
   const h = req.headers;
   if (h["content-length"] !== undefined || h["transfer-encoding"] !== undefined)
     return false;
-  const fk = fastKey(req);
-  if (rawFastStats.enabled && rawFast(fk, req, res)) return true;
-  const url = req.url,
-    q = url.indexOf("?");
+  const url = req.url;
+  const e = rawFastStats.enabled ? findFast(req) : undefined;
+  if (e !== undefined && rawFast(e, req, res)) return true;
+  const q = url.indexOf("?");
   if (!HOT_PATH.test(q < 0 ? url : url.slice(0, q)) || FORMAT_SUFFIX.test(url))
     return false;
   let lean = fastApps.get(app);
@@ -353,7 +353,7 @@ export function fastPath(app, req, res) {
     (h["accept-encoding"] === undefined ||
       contentCoding(h["accept-encoding"]) === "gzip" ||
       contentCoding(h["accept-encoding"]) === "identity")
-      ? { fk }
+      ? {}
       : null;
   lean.handle(req, res);
   return true;
@@ -369,14 +369,29 @@ export function fastPath(app, req, res) {
 const fastEntries = new Map();
 export const rawFastStats = { enabled: true, hits: 0 };
 const MAX_AGE = 20 * 365 * 86400 * 1000;
-function fastKey(req) {
-  return (
-    req.url +
-    "\0" +
-    (req.socket.remoteAddress || "") +
-    "\0" +
-    req.rawHeaders.join("\0")
-  );
+// Entries per URL; a request matches an entry when its client address and
+// raw header list (names, values, order) are identical.
+function findFast(req) {
+  const list = fastEntries.get(req.url);
+  if (list === undefined) return undefined;
+  const raw = req.rawHeaders,
+    n = raw.length,
+    addr = req.socket.remoteAddress;
+  next: for (let j = 0; j < list.length; j++) {
+    const e = list[j],
+      r = e.raw;
+    if (r.length !== n || e.addr !== addr) continue;
+    for (let i = n - 1; i >= 0; i--) if (r[i] !== raw[i]) continue next;
+    return e;
+  }
+  return undefined;
+}
+function dropFast(e) {
+  const list = fastEntries.get(e.url);
+  if (list === undefined) return;
+  const i = list.indexOf(e);
+  if (i >= 0) list.splice(i, 1);
+  if (!list.length) fastEntries.delete(e.url);
 }
 let expSecond = -1,
   expText = "";
@@ -474,8 +489,16 @@ function recordFast(req, res, args, sessionJson, expiry) {
     if (!memo || encodeURIComponent(memo.value) !== sessValue) return;
     sessValue = memo.value;
   }
-  if (fastEntries.size >= 5000) fastEntries.clear();
-  fastEntries.set(rec.fk, {
+  const old = findFast(req);
+  if (old !== undefined) dropFast(old);
+  if (fastEntries.size >= 1000) fastEntries.clear();
+  let list = fastEntries.get(req.url);
+  if (list === undefined) fastEntries.set(req.url, (list = []));
+  if (list.length >= 64) list.shift();
+  list.push({
+    url: req.url,
+    addr: req.socket.remoteAddress,
+    raw: req.rawHeaders.slice(),
     epoch: req.epoch,
     key: rec.key,
     page: rec.page,
@@ -490,9 +513,7 @@ function recordFast(req, res, args, sessionJson, expiry) {
     secret: process.env.SECRET_KEY_BASE,
   });
 }
-function rawFast(fk, req, res) {
-  const e = fastEntries.get(fk);
-  if (e === undefined) return false;
+function rawFast(e, req, res) {
   const t = Date.now();
   if (
     !(t < e.validUntil) ||
@@ -502,7 +523,7 @@ function rawFast(fk, req, res) {
     e.epoch !== cachedEpoch ||
     !pageCurrent(e.key, e.page, e.epoch)
   ) {
-    fastEntries.delete(fk);
+    dropFast(e);
     return false;
   }
   if (e.sessKey !== null) {
