@@ -396,16 +396,91 @@ export function cacheEpoch() {
   if (e !== currentEpoch) {
     messageCache.clear();
     pageCache.clear();
+    rowsCache.clear();
+    layoutPieces.clear();
+    entriesByRows = new WeakMap();
     currentEpoch = e;
   }
   return e;
+}
+// Message rows for one room query (see domain.js messagesForRoom), kept until
+// the epoch moves. The epoch is read before the query, so a stored list is
+// never older than the epoch it is filed under. Lists and rows are frozen.
+const ROWS_CAP = 200;
+const rowsCache = new Map();
+export function cachedRows(key, fn) {
+  const ep = cacheEpoch();
+  if (ep === -1 || ep == null) return fn();
+  let rows = rowsCache.get(key);
+  if (rows) return rows;
+  rows = fn();
+  for (const r of rows) Object.freeze(r);
+  Object.freeze(rows);
+  if (cacheEpoch() === ep) {
+    rowsCache.set(key, rows);
+    if (rowsCache.size > ROWS_CAP)
+      rowsCache.delete(rowsCache.keys().next().value);
+  }
+  return rows;
+}
+// Entries made for a cached (frozen) row list, per origin.
+let entriesByRows = new WeakMap();
+// Layout pieces by their exact text: the deflate stream and CRC of a layout
+// piece are made once and reused while the same text comes back.
+const LAYOUT_CAP = 300;
+const layoutPieces = new Map();
+function layoutPiece(text) {
+  let p = layoutPieces.get(text);
+  if (p) return p;
+  p = piece(text, 1);
+  layoutPieces.set(text, p);
+  if (layoutPieces.size > LAYOUT_CAP)
+    layoutPieces.delete(layoutPieces.keys().next().value);
+  return p;
 }
 const usable = (ep) => ep !== -1 && ep != null && cacheEpoch() === ep;
 const SYNC6 = { finishFlush: zlib.constants.Z_SYNC_FLUSH };
 const SYNC1 = { level: 1, finishFlush: zlib.constants.Z_SYNC_FLUSH };
 function piece(text, level) {
-  return { raw: Buffer.from(text), z: null, level };
+  return { raw: Buffer.from(text), z: null, level, crc: -1, shift: 0 };
 }
+// CRC-32 of the joined pieces by zlib's crc32_combine: each piece keeps its
+// own CRC and x^(8*length) mod P, so a request does one multiply per piece
+// instead of a CRC pass over the whole page.
+function gfMul(a, b) {
+  if (!a) return 0;
+  let m = 0x80000000,
+    p = 0;
+  for (;;) {
+    if (a & m) {
+      p ^= b;
+      if ((a & (m - 1)) === 0) break;
+    }
+    m >>>= 1;
+    b = b & 1 ? (b >>> 1) ^ 0xedb88320 : b >>> 1;
+  }
+  return p >>> 0;
+}
+const POW2 = [0x40000000];
+for (let i = 1; i < 32; i++) POW2.push(gfMul(POW2[i - 1], POW2[i - 1]));
+function byteShift(n) {
+  let p = 0x80000000,
+    k = 3;
+  while (n) {
+    if (n & 1) p = gfMul(POW2[k & 31], p);
+    n = Math.floor(n / 2);
+    k++;
+  }
+  return p >>> 0;
+}
+function crcOf(p) {
+  if (p.crc === -1) {
+    p.crc = zlib.crc32(p.raw);
+    p.shift = byteShift(p.raw.length);
+  }
+  return p;
+}
+const crcJoin = (crc, p) => (gfMul(p.shift, crc) ^ p.crc) >>> 0;
 const zOf = (p) =>
   p.z || (p.z = zlib.deflateRawSync(p.raw, p.level === 1 ? SYNC1 : SYNC6));
 function splitForms(html) {
@@ -425,6 +500,11 @@ function splitForms(html) {
 // Rows come from domain.js `presentation`; the key holds every row field the
 // markup uses, so an entry is never reused for a different row.
 function messageEntries(rows, origin, store) {
+  const frozen = store && Object.isFrozen(rows);
+  if (frozen) {
+    const hit = entriesByRows.get(rows);
+    if (hit && hit.origin === origin) return hit.out;
+  }
   const out = new Array(rows.length),
     misses = [];
   for (let i = 0; i < rows.length; i++) {
@@ -454,6 +534,7 @@ function messageEntries(rows, origin, store) {
       }
     });
   }
+  if (frozen) entriesByRows.set(rows, { origin, out });
   return out;
 }
 // items: piece objects, 1 = escaped CSRF value, 2 = CSRF hidden input.
@@ -463,7 +544,7 @@ function buildPage(layout, entries, tokens) {
   const addLayout = (text) =>
     text.split(TOKEN_MARK).forEach((t, i) => {
       if (i) items.push(1);
-      add(piece(t, 1));
+      if (t.length) items.push(layoutPiece(t));
     });
   let post = null;
   if (layout !== null) {
@@ -920,29 +1001,33 @@ function emit(req, res, page) {
   }
   const s1 = t1 && stored(t1),
     s2 = t2 && stored(t2);
-  const list = [GZ_HEAD];
+  const c1 = t1 && crcOf({ raw: t1, crc: -1 }),
+    c2 = t2 && crcOf({ raw: t2, crc: -1 });
+  const list = new Array(page.items.length + 2);
+  list[0] = GZ_HEAD;
   let crc = 0,
-    size = GZ_HEAD.length + 10;
+    size = GZ_HEAD.length + 10,
+    i = 1;
   for (const p of page.items) {
     let z;
     if (p === 1) {
       z = s1;
-      crc = zlib.crc32(t1, crc);
+      crc = crcJoin(crc, c1);
     } else if (p === 2) {
       z = s2;
-      crc = zlib.crc32(t2, crc);
+      crc = crcJoin(crc, c2);
     } else {
       z = zOf(p);
-      crc = zlib.crc32(p.raw, crc);
+      crc = crcJoin(crc, crcOf(p));
     }
-    list.push(z);
+    list[i++] = z;
     size += z.length;
   }
   const tail = Buffer.alloc(10);
   tail[0] = 3; // final empty fixed-Huffman block, then CRC32 and ISIZE
   tail.writeUInt32LE(crc >>> 0, 2);
   tail.writeUInt32LE(length >>> 0, 6);
-  list.push(tail);
+  list[i] = tail;
   const body = Buffer.concat(list, size);
   setETag(req, res, page, "gz", null, csrf, size);
   return res.send(body);
