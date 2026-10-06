@@ -60,6 +60,10 @@ connection in both runs.
   rebuilding previews as needed. Native-library media bytes can differ.
 - HTML whitespace and malformed-fragment repair can differ. Full byte parity is not claimed.
 - Direct-room autocomplete explicitly requests JSON, repairing the original fetch-header bug.
+- The sidebar keeps each user's room list HTML until the next database write by any
+  process. Without the page cache (not-crazy-perf), its gzip answer sends the per-request
+  head and tail as stored (not compressed)
+  deflate blocks, so the compressed size and the `ETag` differ; the decoded HTML is the same.
 - Backups require a maintenance window for consistent database and file snapshots. App and
   queue snapshots are separate; external job effects have at-least-once delivery.
 

@@ -58,6 +58,22 @@ request anyway); brotli, deflate, identity and HEAD still go through the
 normal middleware. Verified by decoding with Node zlib and by the parity
 harness.
 
+Sidebar room list (`sidebarState` in `src/routes.js`): the HTML of one user's
+room list (direct and shared rooms, from `sidebarRooms` in
+`src/fast_templates.js`) and the account's room-creation rule are kept per
+user while `epoch()` is unchanged (a write by any process starts a new
+build). The head (signed stream names) and the tail (avatar, new-room button)
+are built for each request. On `not-crazy-perf`, which has no page cache, the
+route sends these three parts through `sendParts` in `src/rendering.js`: the
+room list keeps its own deflate, and the head and tail go out as stored
+(not compressed) deflate blocks, so a sidebar request does no zlib work while
+the epoch is unchanged. Deliberate differences: the gzip bytes are larger
+than before and the `ETag` (a hash of the sent bytes) changes; the decoded
+HTML is the same. Checked: decoded body byte-identical to the earlier code,
+the parity harness (only the expected header differences), and a rename, an
+account setting change and an unread mark written by a second process all
+show up on the next sidebar request.
+
 `epoch()` first reads the 96-byte WAL-index header at the start of the
 `-shm` file. Every commit by any connection (this one included) and every WAL
 restart rewrites that header (change counter, frame count, salts, checksums;
