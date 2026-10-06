@@ -60,6 +60,7 @@ export function initialize(
 }
 const statements = new Map();
 export function stmt(sql) {
+  dbOps++;
   let s = statements.get(sql);
   if (!s) statements.set(sql, (s = db().prepare(sql)));
   return s;
@@ -108,6 +109,34 @@ export function epoch() {
   }
   return epochValue;
 }
+// Net front hits (src/netfront.js) share one epoch read per event-loop turn:
+// the value is reused until the next check phase (setImmediate) and only while
+// this process ran no SQL since the read (every statement goes through stmt()
+// or transaction(), which bump dbOps). Requests read from the kernel in the
+// same poll phase after another process's commit can see the epoch from the
+// start of that phase; a client that waits for the commit's response before
+// sending its next request is never in that phase's ready list (see
+// plans/contracts.md).
+let dbOps = 0,
+  turnOps = -1,
+  turnEp = 0,
+  turnArmed = false;
+const turnReset = () => {
+  turnArmed = false;
+  turnOps = -1;
+};
+export function turnEpoch() {
+  if (turnOps === dbOps && turnOps !== -1) return turnEp;
+  const v = epoch();
+  if (v === -1) return v;
+  turnEp = v;
+  turnOps = dbOps;
+  if (!turnArmed) {
+    turnArmed = true;
+    setImmediate(turnReset);
+  }
+  return v;
+}
 export function db() {
   return connection || initialize();
 }
@@ -155,6 +184,7 @@ function begin() {
 // keeps serving other work: it retries BEGIN IMMEDIATE from the event loop.
 let begun = false;
 export async function writeTransaction(fn) {
+  dbOps++;
   if (depth) return transaction(fn);
   const c = db();
   let deadline = 0;
@@ -176,6 +206,7 @@ export async function writeTransaction(fn) {
   return transaction(fn);
 }
 export function transaction(fn) {
+  dbOps++;
   const name = `nested_${depth}`,
     nested = depth > 0;
   if (nested) db().exec(`SAVEPOINT ${name}`);
