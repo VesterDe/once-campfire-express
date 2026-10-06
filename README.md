@@ -30,15 +30,26 @@ and [benchmark commands](bench/README.md) for the production comparison.
 ## Benchmarks
 
 Measured with 16 concurrent clients on an AMD Ryzen AI MAX+ 395,
-with four hardware threads allocated to each app.
+with four hardware threads allocated to each app. The Express column is from this
+branch (perf, `c84d315`), measured separately; see the note below the table.
 
 | HTTP workload (requests/sec) | Rails | [Django](https://github.com/basecamp/once-campfire-django) | [Laravel](https://github.com/basecamp/once-campfire-laravel) | [Express](https://github.com/basecamp/once-campfire-express) | [Elixir](https://github.com/basecamp/once-campfire-elixir) | [Go](https://github.com/basecamp/once-campfire-go) | [Rust](https://github.com/basecamp/once-campfire-rust) |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| Room page | 241 | 170 | 164 | 559 | 722 | 3,860 | 36,260 |
-| Messages page | 413 | 196 | 175 | 777 | 1,053 | 5,573 | 40,872 |
-| Sidebar | 552 | 615 | 715 | 4,125 | 1,275 | 19,753 | 34,672 |
-| Search | 435 | 315 | 305 | 1,294 | 1,156 | 7,053 | 33,299 |
-| Post a message | 273 | 154 | 137 | 256 | 801 | 4,767 | 6,896 |
+| Room page | 241 | 170 | 164 | 503,686 | 722 | 3,860 | 36,260 |
+| Messages page | 413 | 196 | 175 | 529,579 | 1,053 | 5,573 | 40,872 |
+| Sidebar | 552 | 615 | 715 | 540,889 | 1,275 | 19,753 | 34,672 |
+| Search | 435 | 315 | 305 | 525,366 | 1,156 | 7,053 | 33,299 |
+| Post a message | 273 | 154 | 137 | 9,316 | 801 | 4,767 | 6,896 |
+
+The Express numbers come from an AWS c8a.4xlarge (eu-west-1, AMD EPYC 9R45, EBS gp3 disk)
+with the same loadgen and `bench/compare.rb`: the app on CPUs 8-11, the loadgen on CPUs
+12-15, 16 clients, medians of four runs. Rails ran in the same runs as the anchor and got
+239 / 418 / 571 / 438 / 274, close to the column above, so the read workloads compare.
+Writes that wait for the disk are slower on that machine: unmodified Express main posted
+92 messages/sec there (256 above) and the Rust port 1,854 (6,896 above). This branch commits
+posts in groups, so it waits for the disk much less per post. Most read answers on this branch are
+replayed from stored responses (see Known differences); the not-crazy-perf branch
+leaves that out.
 
 At 100 WebSocket connections and five messages/second, median delivery to every
 connection was 24 ms for Rails and 14 ms for Express. Every message reached every
