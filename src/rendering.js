@@ -628,3 +628,24 @@ export function sendMessages(req, res, ep, makeRows) {
   emit(req, res, buildPage(null, messageEntries(rows, "", ok), false));
   return true;
 }
+// A kept text part: its deflate is made once, on first use, and kept with it.
+export const textPiece = (text) => piece(text, 1);
+// Sends a page without CSRF tokens made of parts in order. A string part is
+// new for this request and goes out as stored (not compressed) deflate
+// blocks, so it costs no zlib work; a textPiece part reuses its kept deflate.
+// The decoded body is the parts joined.
+export function sendParts(req, res, parts) {
+  const items = [];
+  let len = 0;
+  for (const p of parts) {
+    let it = p;
+    if (typeof p === "string") {
+      const raw = Buffer.from(p);
+      it = { raw, z: stored(raw), level: 0 };
+    }
+    if (!it.raw.length) continue;
+    items.push(it);
+    len += it.raw.length;
+  }
+  return emit(req, res, { id: ++pageSeq, items, len, n1: 0, n2: 0 });
+}
