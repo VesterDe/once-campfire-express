@@ -14,8 +14,8 @@ docker run --rm -p 8080:80 -e SECRET_KEY_BASE="$(openssl rand -hex 64)" \
 
 Existing installs must reuse their `SECRET_KEY_BASE` and mount their storage at
 `/rails/storage`. Preserve VAPID keys for existing push subscriptions. `WEB_WORKERS`
-sets the HTTP process count; publications pass through the primary process to every
-worker. A separate leased SQLite queue handles jobs. TLS terminates at a proxy;
+sets the HTTP process count (default: available CPUs); publications pass through the
+primary process to workers that hold WebSocket connections. A separate leased SQLite queue handles jobs. TLS terminates at a proxy;
 configure `TRUSTED_PROXIES` with its addresses.
 
 For local development, use the pinned Node version, run `npm ci`,
