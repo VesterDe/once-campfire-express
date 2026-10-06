@@ -29,6 +29,8 @@ import {
   cacheEpoch,
   sendPage,
   sendMessages,
+  sendParts,
+  textPiece,
   signStream,
   userData,
   avatar,
@@ -49,7 +51,7 @@ import {
   purgeBlob,
 } from "./storage.js";
 import { enqueue } from "./jobs.js";
-import { sidebarRooms } from "./fast_templates.js";
+import { sidebarRooms, sidebarHead, sidebarTail } from "./fast_templates.js";
 // The sidebar room list (HTML) and the account's room rule for one user, kept
 // while the database epoch is unchanged. A write by any process changes the
 // epoch, so the next request builds them again.
@@ -428,13 +430,23 @@ export function registerRoutes(app) {
     res.redirect("/");
   });
   app.get(["/users/me/sidebar", "/users/:id/sidebar"], login, (req, res) => {
-    sendPage(req, res, "sidebar", cacheEpoch(), () => {
-      const s = sidebarState(req.user);
-      return {
-        SidebarMid: s.mid,
-        CanCreateRooms: req.user.role === 1 || !s.restrict,
-      };
-    });
+    // Head and tail (stream names, avatar, new-room button) are built for
+    // each request; the room list comes from sidebarState() with its kept
+    // deflate. The sidebar has no form, so it carries no CSRF token.
+    const user = req.user;
+    const s = sidebarState(user);
+    s.piece ||= textPiece(s.mid);
+    const d = {
+      User: { ID: user.id, UpdatedAt: user.updated_at },
+      RoomsStream: signStream("rooms"),
+      UserRoomsStream: signStream(
+        Buffer.from(`gid://campfire/User/${user.id}`)
+          .toString("base64")
+          .replace(/=+$/, "") + ":rooms",
+      ),
+      CanCreateRooms: user.role === 1 || !s.restrict,
+    };
+    sendParts(req, res, [sidebarHead(d), s.piece, sidebarTail(d)]);
   });
   app.all(
     [
