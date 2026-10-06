@@ -480,14 +480,15 @@ const BOOT = randomUUID();
 // Express would hash the whole body for its ETag on every request. A fixed
 // page gets that same ETag once; a page with a CSRF token gets one built from
 // the page identity and the token, which also changes exactly when the body does.
-function etagFor(fn, page, kind, body, tokenText, length) {
-  if (!fn) return undefined;
-  if (body) return (page["etag" + kind] ||= fn(body, "utf8"));
+function setETag(req, res, page, kind, body, tokenText, length) {
+  const fn = req.app?.get?.("etag fn");
+  if (!fn) return;
+  if (body) return res.set("ETag", (page["etag" + kind] ||= fn(body, "utf8")));
   const hash = createHash("sha1")
     .update(`${BOOT}|${page.id}|${kind}|${tokenText}`)
     .digest("base64")
     .slice(0, 27);
-  return `W/"${length.toString(16)}-${hash}"`;
+  res.set("ETag", `W/"${length.toString(16)}-${hash}"`);
 }
 function storePage(key, page) {
   pageCache.set(key, page);
@@ -505,12 +506,21 @@ const SUPPORTED = brotli
     : ["gzip", "deflate", "identity"],
   PREFERRED = brotli ? ["br", "gzip"] : ["gzip"];
 const NO_TRANSFORM = /(?:^|,)\s*?no-transform\s*?(?:,|$)/i;
+// The answer depends only on the Accept-Encoding text, so it is kept per text.
+const gzipByHeader = new Map();
 function wantsGzip(req, res, length) {
   if (length < 1024 || req.method === "HEAD") return false;
-  if (!req.headers?.["accept-encoding"]) return false;
+  const ae = req.headers?.["accept-encoding"];
+  if (!ae) return false;
   const cc = res.getHeader("Cache-Control");
   if (cc && NO_TRANSFORM.test(String(cc))) return false;
-  return new Negotiator(req).encoding(SUPPORTED, PREFERRED) === "gzip";
+  let v = gzipByHeader.get(ae);
+  if (v === undefined) {
+    v = new Negotiator(req).encoding(SUPPORTED, PREFERRED) === "gzip";
+    if (gzipByHeader.size > 100) gzipByHeader.clear();
+    gzipByHeader.set(ae, v);
+  }
+  return v;
 }
 const GZ_HEAD = Buffer.from([0x1f, 0x8b, 8, 0, 0, 0, 0, 0, 0, 3]);
 // Non-final stored deflate blocks; the stream before them is byte aligned.
@@ -692,12 +702,148 @@ function templateGzip(page, L) {
   }
   return g;
 }
-// Body and ETag of a cached page for one CSRF token (escaped text, or
-// undefined for a page without tokens).
-function pageBody(page, csrf, gz, fn) {
+// What res.send does for a 200 Buffer body, without its helpers: used only
+// when the request has no conditional headers (so no 304) and is a GET.
+const HTML_TYPE = "text/html; charset=utf-8";
+function quick(req) {
+  const h = req.headers;
+  return (
+    req.method === "GET" &&
+    h["if-none-match"] === undefined &&
+    h["if-modified-since"] === undefined &&
+    typeof req.app?.get === "function"
+  );
+}
+function finish(res, body, etag, gz) {
+  res.setHeader("Content-Type", HTML_TYPE);
+  if (gz) {
+    res.setHeader("Content-Encoding", "gzip");
+    const vary = res.getHeader("Vary");
+    if (vary === undefined) res.setHeader("Vary", "Accept-Encoding");
+    else res.vary("Accept-Encoding");
+  }
+  res.setHeader("ETag", etag);
+  res.setHeader("Content-Length", body.length);
+  res.end(body);
+}
+// Weak ETag the same way Express' default "etag fn" makes it.
+const weakEtag = createRequire(localRequire.resolve("express"))("etag");
+const gzipFor = (ae) => {
+  if (!ae) return false;
+  let v = gzipByHeader.get(ae);
+  if (v === undefined) {
+    v =
+      new Negotiator({ headers: { "accept-encoding": ae } }).encoding(
+        SUPPORTED,
+        PREFERRED,
+      ) === "gzip";
+    if (gzipByHeader.size > 100) gzipByHeader.clear();
+    gzipByHeader.set(ae, v);
+  }
+  return v;
+};
+// The 200 body for a cached page and this request's CSRF token, or null when
+// only the slow path in emit() can build it (plain token page, no template).
+function respond(page, csrfToken, gzipOk) {
+  if (!page.n1 && !page.n2) {
+    const body = (page.raw ||= Buffer.concat(page.items.map((p) => p.raw)));
+    if (body.length < 1024 || !gzipOk)
+      return {
+        body,
+        etag: (page.etagraw ||= weakEtag(body, { weak: true })),
+        gz: false,
+      };
+    page.gz ||= zlib.gzipSync(body);
+    return {
+      body: page.gz,
+      etag: (page.etaggz ||= weakEtag(page.gz, { weak: true })),
+      gz: true,
+    };
+  }
+  const t1 = Buffer.from(escape(csrfToken || ""));
+  const length =
+    page.len +
+    page.n1 * t1.length +
+    page.n2 * (t1.length + INPUT_HEAD.length + INPUT_TAIL.length);
+  if (length < 1024 || !gzipOk) return null;
+  if (page.tpl?.L !== t1.length)
+    page.tpl = templateGzip(page, t1.length) || { L: t1.length, z: null };
+  const g = page.tpl;
+  if (!g.z) return null;
+  const crc = tokenCrc(g, t1);
+  const n = g.z.length,
+    body = Buffer.allocUnsafe(n + 8);
+  g.z.copy(body);
+  for (const at of g.anchors) t1.copy(body, at);
+  body.writeUInt32LE(crc >>> 0, n);
+  body.writeUInt32LE(length >>> 0, n + 4);
+  // The body CRC (with page id, length and a CRC of the token) names this body.
+  const etag = `W/"${body.length.toString(16)}-${BOOT_TAG}${page.id.toString(36)}.${crc.toString(36)}.${zlib.crc32(t1).toString(36)}"`;
+  return { body, etag, gz: true };
+}
+function emitQuick(req, res, page) {
+  const e = req.app.get("etag");
+  if (e !== "weak" && e !== true) return null;
+  const cc = res.getHeader("Cache-Control");
+  const gzipOk =
+    !(cc && NO_TRANSFORM.test(String(cc))) &&
+    gzipFor(req.headers["accept-encoding"]);
+  const r = respond(page, req.csrfToken, gzipOk);
+  if (!r) return null;
+  const rec = req.fastRecord;
+  if (rec) {
+    rec.page = page;
+    rec.gzipOk = gzipOk;
+  }
+  return finish(res, r.body, r.etag, r.gz);
+}
+// Raw fast path (src/app.js): true while `page` is still the cache entry for
+// `key` at epoch `ep`, i.e. what sendPage/sendMessages would serve.
+export function pageCurrent(key, page, ep) {
+  return currentEpoch === ep && pageCache.get(key) === page;
+}
+// Body and ETag exactly as emitQuick() sends them, for a fresh CSRF mask.
+export function fastPageBody(page, rawCsrf, gzipOk) {
+  return respond(
+    page,
+    !page.n1 && !page.n2 ? undefined : rails.maskCsrf(rawCsrf),
+    gzipOk,
+  );
+}
+// For a front server that skips Express: the cached page for this request, as
+// writeHead() header pairs plus body, or null on a miss (then run the route).
+// ctx: { screen, key, ep, protocol, host, turboFrame, lastRoomId, user,
+//        csrfToken, acceptEncoding }. screen "messages" is the bare list
+// (sendMessages); key and ep are what the route passes to sendPage().
+// The caller adds the security headers and Set-Cookie, and must only use
+// this for a GET without If-None-Match / If-Modified-Since.
+export function pageHit(ctx) {
+  const page = lookup(
+    ctx.screen,
+    ctx.key,
+    ctx.ep,
+    ctx.protocol,
+    ctx.host,
+    ctx.turboFrame,
+    ctx.lastRoomId,
+    ctx.user,
+  );
+  if (!page) return null;
+  const r = respond(page, ctx.csrfToken, gzipFor(ctx.acceptEncoding));
+  if (!r) return null;
+  const headers = ["Content-Type", HTML_TYPE];
+  if (r.gz) headers.push("Content-Encoding", "gzip", "Vary", "Accept-Encoding");
+  headers.push("ETag", r.etag, "Content-Length", String(r.body.length));
+  return { status: 200, headers, body: r.body };
+}
+const BOOT_TAG = BOOT.slice(0, 8);
+function emit(req, res, page) {
+  if (quick(req) && emitQuick(req, res, page) !== null) return;
+  res.type("html");
   const fixed = !page.n1 && !page.n2;
-  let t1, t2;
+  let t1, t2, csrf;
   if (!fixed) {
+    csrf = escape(req.csrfToken || "");
     t1 = Buffer.from(csrf);
     t2 = Buffer.from(
       `<input type="hidden" name="authenticity_token" value="${csrf}">`,
@@ -705,27 +851,29 @@ function pageBody(page, csrf, gz, fn) {
   }
   const length =
     page.len + (fixed ? 0 : page.n1 * t1.length + page.n2 * t2.length);
-  if (!gz) {
+  if (!wantsGzip(req, res, length)) {
     if (fixed) {
       const body = (page.raw ||= Buffer.concat(page.items.map((p) => p.raw)));
-      return [body, etagFor(fn, page, "raw", body)];
+      setETag(req, res, page, "raw", body);
+      return res.send(body);
     }
     const list = new Array(page.items.length);
     for (let i = 0; i < list.length; i++) {
       const p = page.items[i];
       list[i] = p === 1 ? t1 : p === 2 ? t2 : p.raw;
     }
-    return [
-      Buffer.concat(list, length),
-      etagFor(fn, page, "raw", null, csrf, length),
-    ];
+    setETag(req, res, page, "raw", null, csrf, length);
+    return res.send(Buffer.concat(list, length));
   }
+  res.set("Content-Encoding", "gzip");
+  res.vary("Accept-Encoding");
   if (fixed) {
     // No CSRF token: one ordinary gzip of the whole body, made once.
     page.gz ||= zlib.gzipSync(
       (page.raw ||= Buffer.concat(page.items.map((p) => p.raw))),
     );
-    return [page.gz, etagFor(fn, page, "gz", page.gz)];
+    setETag(req, res, page, "gz", page.gz);
+    return res.send(page.gz);
   }
   if (page.tpl?.L !== t1.length)
     page.tpl = templateGzip(page, t1.length) || { L: t1.length, z: null };
@@ -738,10 +886,11 @@ function pageBody(page, csrf, gz, fn) {
     for (const at of g.anchors) t1.copy(body, at);
     body.writeUInt32LE(crc >>> 0, n);
     body.writeUInt32LE(length >>> 0, n + 4);
-    return [body, etagFor(fn, page, "gzt", null, csrf, body.length)];
+    setETag(req, res, page, "gzt", null, csrf, body.length);
+    return res.send(body);
   }
-  const s1 = stored(t1),
-    s2 = stored(t2);
+  const s1 = t1 && stored(t1),
+    s2 = t2 && stored(t2);
   const list = [GZ_HEAD];
   let crc = 0,
     size = GZ_HEAD.length + 10;
@@ -766,62 +915,60 @@ function pageBody(page, csrf, gz, fn) {
   tail.writeUInt32LE(length >>> 0, 6);
   list.push(tail);
   const body = Buffer.concat(list, size);
-  return [body, etagFor(fn, page, "gz", null, csrf, size)];
-}
-function emit(req, res, page) {
-  res.type("html");
-  const fixed = !page.n1 && !page.n2;
-  const csrf = fixed ? undefined : escape(req.csrfToken || "");
-  const length =
-    page.len +
-    (fixed
-      ? 0
-      : page.n1 * Buffer.byteLength(csrf) +
-        page.n2 *
-          Buffer.byteLength(
-            `<input type="hidden" name="authenticity_token" value="${csrf}">`,
-          ));
-  const gz = wantsGzip(req, res, length);
-  if (gz) {
-    res.set("Content-Encoding", "gzip");
-    res.vary("Accept-Encoding");
-  }
-  const fn = req.app?.get?.("etag fn");
-  const [body, etag] = pageBody(page, csrf, gz, fn);
-  if (etag !== undefined) res.set("ETag", etag);
-  const rec = req.fastRecord;
-  if (rec) {
-    rec.page = page;
-    rec.gz = gz;
-    rec.fn = fn;
-  }
+  setETag(req, res, page, "gz", null, csrf, size);
   return res.send(body);
-}
-// Raw fast path (src/app.js): true while `page` is still the cache entry for
-// `key` at epoch `ep`, i.e. what sendPage/sendMessages would serve.
-export function pageCurrent(key, page, ep) {
-  return currentEpoch === ep && pageCache.get(key) === page;
-}
-export function fastPageBody(page, rawCsrf, gz, fn) {
-  return pageBody(
-    page,
-    !page.n1 && !page.n2 ? undefined : escape(rails.maskCsrf(rawCsrf)),
-    gz,
-    fn,
-  );
 }
 // Full page with layout. `makeExtra()` runs only on a cache miss; its
 // MessageRows/MessageOrigin are spliced in from the per-message cache. `key`
 // names what the route data depends on besides the user row, host, protocol,
 // Turbo-Frame and session last room; null turns the page cache off.
+// The route called cacheEpoch() just before, so a lookup only needs the epoch
+// to still be the current one; stores check it again with usable().
+const current = (ep) => ep !== -1 && ep != null && ep === currentEpoch;
+// The key holds the user id; the whole row is compared field by field on a hit
+// (cheaper than putting JSON.stringify(row) in the key on every request).
+function sameRow(a, b) {
+  if (a === b) return true;
+  if (!a || !b) return false;
+  let n = 0;
+  for (const k in a) {
+    if (a[k] !== b[k]) return false;
+    n++;
+  }
+  for (const k in b) n--;
+  return n === 0;
+}
+const pageKey = (screen, key, protocol, host, turboFrame, lastRoomId, user) =>
+  screen === "messages"
+    ? "messages|" + key
+    : `${screen}|${key}|${protocol}|${host}|${!!turboFrame}|${lastRoomId || ""}|${user ? user.id : ""}`;
+function lookup(screen, key, ep, protocol, host, turboFrame, lastRoomId, user) {
+  if (!current(ep) || key == null) return null;
+  const page = pageCache.get(
+    pageKey(screen, key, protocol, host, turboFrame, lastRoomId, user),
+  );
+  return page && (screen === "messages" || sameRow(page.user, user || null))
+    ? page
+    : null;
+}
 export function sendPage(req, res, screen, ep, key, makeExtra) {
-  const ok = usable(ep);
+  const h = req.headers || {};
   const fullKey =
-    ok && key != null
-      ? `${screen}|${key}|${req.protocol}|${req.get?.("host")}|${!!req.get?.("Turbo-Frame")}|${req.session?.last_room_id || ""}|${req.user ? JSON.stringify(req.user) : ""}`
+    current(ep) && key != null
+      ? pageKey(
+          screen,
+          key,
+          req.protocol,
+          h.host,
+          h["turbo-frame"],
+          req.session?.last_room_id,
+          req.user,
+        )
       : null;
   let page = fullKey && pageCache.get(fullKey);
+  if (page && !sameRow(page.user, req.user || null)) page = null;
   if (!page) {
+    const ok = usable(ep);
     const {
       MessageRows: rows,
       MessageOrigin: origin = "",
@@ -838,6 +985,7 @@ export function sendPage(req, res, screen, ep, key, makeExtra) {
     if (rows && layout.split(MESSAGES_MARK).length !== 2)
       throw new Error(`${screen} page must print its messages exactly once`);
     page = buildPage(layout, entries, true);
+    page.user = req.user || null;
     if (fullKey && usable(ep)) storePage(fullKey, page);
   }
   if (req.fastRecord) req.fastRecord.key = fullKey;
@@ -845,10 +993,10 @@ export function sendPage(req, res, screen, ep, key, makeExtra) {
 }
 // The bare messages list (pagination). Returns false when there are no rows.
 export function sendMessages(req, res, ep, key, makeRows) {
-  const ok = usable(ep),
-    fullKey = ok && key != null ? "messages|" + key : null;
+  const fullKey = current(ep) && key != null ? "messages|" + key : null;
   let page = fullKey && pageCache.get(fullKey);
   if (!page) {
+    const ok = usable(ep);
     const rows = makeRows();
     if (!rows.length) return false;
     page = buildPage(null, messageEntries(rows, "", ok), false);

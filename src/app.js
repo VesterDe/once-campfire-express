@@ -479,8 +479,7 @@ function recordFast(req, res, args, sessionJson, expiry) {
     epoch: req.epoch,
     key: rec.key,
     page: rec.page,
-    gz: rec.gz,
-    fn: rec.fn,
+    gzipOk: rec.gzipOk,
     csrf,
     status,
     template,
@@ -517,7 +516,10 @@ function rawFast(fk, req, res) {
     )
       return false;
   }
-  const [body, etag] = fastPageBody(e.page, e.csrf, e.gz, e.fn);
+  const r = fastPageBody(e.page, e.csrf, e.gzipOk);
+  if (r === null) return false;
+  const body = r.body,
+    etag = r.etag;
   const h = e.template.slice(),
     s = e.slots;
   h[s.len] = String(body.length);
