@@ -67,6 +67,7 @@ HTML is the same. Checked: decoded body byte-identical to the earlier code,
 the parity harness (only the expected header differences), and a rename, an
 account setting change and an unread mark written by a second process all
 show up on the next sidebar request.
+
 Search data cache (`registerSearch` in `src/routes.js`): the result rows and
 the recent-search list for one (user id, cleaned query) are kept per process
 under the `epoch()` read before the queries, at most 256 entries, and dropped
