@@ -80,17 +80,25 @@ is written as one Buffer that is byte-identical to what node:http writes for
 the raw repeat path (headers, then `Date`, `Connection: keep-alive`,
 `Keep-Alive: timeout=N`, then body). Several hits pipelined in one TCP read
 share one `epoch()` read (same synchronous run, nothing else can commit in
-between). On the first request that is not such a hit, the unread bytes are
-put back on the socket and the socket is handed to the node:http server for
-the rest of its life (so the miss still records an entry, and WebSocket
-upgrades, POSTs, HTTP/1.0 and `Connection: close` behave as before). Limits:
+between). A front-eligible GET that is not a hit is served on the same
+socket: the front builds node's own `IncomingMessage` (method, URL, raw
+headers, HTTP/1.1, no body) and `ServerResponse` (keep-alive, server
+keep-alive timeout), emits the http server's `request` event, and reads the
+socket again after `finish` (so the miss records an entry and later repeats
+on that socket are front hits). Any other request (other method, body
+headers, `Upgrade`, HTTP/1.0, `Connection: close`, header syntax the front
+does not parse exactly like llhttp) puts the unread bytes back and hands the
+socket to the node:http server for the rest of its life, so WebSocket
+upgrades and POSTs (including `src/fast_post.js`) run unchanged. Limits:
 idle front sockets close after `keepAliveTimeout`, but node:http's
 `headersTimeout`/`requestTimeout` only apply after hand-off; a partial head
-larger than 16 KiB is handed off. `test/net_front.test.js` checks hits,
+larger than 16 KiB is handed off; while a front miss is in flight, later
+pipelined bytes wait and are not parsed. `test/net_front.test.js` checks hits,
 byte equality with node:http in the same second, keep-alive, split and
-pipelined heads, miss hand-off, `Connection: close`, HTTP/1.0, POST and the
-cable WebSocket. The parity harness runs with a frozen clock, so there it
-only exercises the hand-off path.
+pipelined heads, misses served in place (same header names as node:http, no
+listener leak), hand-off, `Connection: close`, HTTP/1.0, POST and the
+cable WebSocket. The parity harness runs with a frozen clock (no hits), so there
+it exercises the in-place miss and hand-off paths.
 
 `epoch()` first reads the 96-byte WAL-index header at the start of the
 `-shm` file. Every commit by any connection (this one included) and every WAL

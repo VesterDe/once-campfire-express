@@ -7,6 +7,7 @@
 // back on the socket and the socket is handed to the http server for the rest
 // of its life, so node:http handles it exactly as before.
 import net from "node:net";
+import { IncomingMessage, ServerResponse } from "node:http";
 import { netFast } from "./app.js";
 import { epoch } from "./db.js";
 
@@ -68,7 +69,56 @@ export function createFront(httpServer) {
       if (rest !== null && rest.length) socket.unshift(rest);
       httpServer.emit("connection", socket);
     };
+    // A front-eligible GET that is not a hit is served on this same socket
+    // through the http server's request handler with node's own
+    // IncomingMessage/ServerResponse (the same objects node:http builds for
+    // a parsed GET without body); the front reads the socket again after the
+    // response finishes. Bytes arriving meanwhile wait in `pending`.
+    let busy = false;
+    const serveMiss = (p) => {
+      busy = true;
+      socket.setTimeout(0);
+      const req = new IncomingMessage(socket);
+      req.httpVersionMajor = 1;
+      req.httpVersionMinor = 1;
+      req.httpVersion = "1.1";
+      req.method = "GET";
+      req.url = p.url;
+      req._addHeaderLines(p.raw.slice(), p.raw.length);
+      req.complete = true;
+      req.push(null);
+      const res = new ServerResponse(req);
+      res._keepAliveTimeout = httpServer.keepAliveTimeout;
+      res.shouldKeepAlive = true;
+      res.assignSocket(socket);
+      res.on("finish", () => {
+        res.detachSocket(socket);
+        process.nextTick(() => res.emit("close"));
+        busy = false;
+        if (res._last || socket.destroyed) {
+          socket.destroySoon();
+          return;
+        }
+        const kat = httpServer.keepAliveTimeout;
+        if (kat > 0) socket.setTimeout(kat);
+        if (pending !== null) {
+          const b = pending;
+          pending = null;
+          onData(b);
+        }
+      });
+      try {
+        httpServer.emit("request", req, res);
+      } catch (error) {
+        console.error(error);
+        socket.destroy();
+      }
+    };
     const onData = (chunk) => {
+      if (busy) {
+        pending = pending === null ? chunk : Buffer.concat([pending, chunk]);
+        return;
+      }
       let buf = pending === null ? chunk : Buffer.concat([pending, chunk]);
       pending = null;
       const kat = httpServer.keepAliveTimeout;
@@ -92,13 +142,19 @@ export function createFront(httpServer) {
         if (p === null) break;
         if (ep === -2) ep = epoch();
         const out = netFast(p.url, p.raw, addr, tail, ep);
-        if (out === null) break;
-        if (!corked && buf.length > end + 4) {
+        const rest = buf.subarray(end + 4);
+        if (out === null) {
+          if (corked) socket.uncork();
+          if (rest.length) pending = rest;
+          serveMiss(p);
+          return;
+        }
+        if (!corked && rest.length) {
           socket.cork();
           corked = true;
         }
         socket.write(out);
-        buf = buf.subarray(end + 4);
+        buf = rest;
         if (!buf.length) {
           if (corked) socket.uncork();
           return;
@@ -115,6 +171,7 @@ export function createFront(httpServer) {
     socket.on("error", onError);
     socket.on("close", onClose);
   });
+  front.sockets = () => open;
   const close = front.close;
   front.close = function (cb) {
     for (const s of open) s.end();

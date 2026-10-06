@@ -149,16 +149,18 @@ const req = (path, cookie, extra = "") =>
   `Accept-Encoding: gzip\r\nSec-Fetch-Site: same-origin\r\n${extra}\r\n`;
 const statusOf = (b) => Number(b.latin1Slice(9, 12));
 const headOf = (b) => b.latin1Slice(0, b.indexOf("\r\n\r\n"));
+const ODD = "GET /up HTTP/1.1\r\nHost: x\r\nX-Pad: y \r\n\r\n";
 const dateOf = (b) => /\r\nDate: ([^\r]*)/.exec(headOf(b))[1];
 test("net front: hits, byte parity, keep-alive, miss hand-off", async () => {
   const cookie = await login("u0@example.test");
   const path = `/rooms/${room}`;
   for (let round = 0; round < 5; round++) {
-    // First request on a fresh socket misses, goes to node:http and records.
+    // Socket a: a first request the front does not parse (trailing space in
+    // a header value) hands it to node:http for good; then a miss records.
     const a = conn();
-    a.send(req(path, cookie));
-    await a.wait(1);
-    assert.equal(statusOf(a.responses[0]), 200);
+    a.send(ODD + req(path, cookie));
+    await a.wait(2);
+    assert.equal(statusOf(a.responses[1]), 200);
     // Fresh socket: two pipelined repeats in one write, then one more split
     // over two writes, all answered by the front on one keep-alive socket.
     const hits = rawFastStats.hits;
@@ -173,10 +175,10 @@ test("net front: hits, byte parity, keep-alive, miss hand-off", async () => {
     for (const r of b.responses) assert.equal(statusOf(r), 200);
     // Socket a now belongs to node:http; its repeat uses rawFast there.
     a.send(req(path, cookie));
-    await a.wait(2);
+    await a.wait(3);
     assert.equal(rawFastStats.hits, hits + 4);
     const s1 = b.responses[2],
-      s2 = a.responses[1];
+      s2 = a.responses[2];
     a.s.destroy();
     if (dateOf(s1) !== dateOf(s2)) {
       b.s.destroy();
@@ -185,23 +187,56 @@ test("net front: hits, byte parity, keep-alive, miss hand-off", async () => {
     // Same clock second: the front's bytes equal node:http's bytes.
     assert.equal(headOf(s1), headOf(s2));
     assert.ok(s1.equals(s2));
-    // A miss after hits hands the socket off; later requests still work.
+    // A miss after hits is served in place; the front keeps the socket and
+    // the next repeat is a front hit again. Then an odd head hands it off.
+    const h2 = rawFastStats.hits;
     b.send(`GET /nope HTTP/1.1\r\nHost: x\r\n\r\n` + req(path, cookie));
     await b.wait(5);
     assert.equal(statusOf(b.responses[3]), 404);
     assert.equal(statusOf(b.responses[4]), 200);
+    assert.equal(rawFastStats.hits, h2 + 1);
+    b.send(ODD + req(path, cookie));
+    await b.wait(7);
+    assert.equal(statusOf(b.responses[6]), 200);
     assert.ok(!b.closed);
     b.s.destroy();
     return;
   }
   assert.fail("no same-second sample");
 });
+test("net front: a miss served in place matches node:http", async () => {
+  const cookie = await login("u1@example.test");
+  const names = (b) =>
+    headOf(b)
+      .split("\r\n")
+      .map((l, i) => (i ? l.split(":")[0] : l));
+  const f = conn();
+  f.send(req("/searches?q=hello", cookie));
+  await f.wait(1);
+  const h = conn();
+  h.send(ODD + req("/searches?q=number", cookie));
+  await h.wait(2);
+  assert.deepEqual(names(f.responses[0]), names(h.responses[1]));
+  const hits = rawFastStats.hits;
+  f.send(req("/searches?q=hello", cookie));
+  await f.wait(2);
+  assert.equal(rawFastStats.hits, hits + 1);
+  assert.equal(statusOf(f.responses[1]), 200);
+  // Many misses in place on one socket leave no listeners behind.
+  for (let i = 0; i < 20; i++) f.send(req("/searches?q=x" + i, cookie));
+  await f.wait(22);
+  for (const r of f.responses) assert.equal(statusOf(r), 200);
+  const [srv] = [...front.sockets()];
+  for (const ev of ["close", "error", "end", "finish", "drain"])
+    assert.ok(srv.listenerCount(ev) <= 3, ev + " " + srv.listenerCount(ev));
+  for (const x of [f, h]) x.s.destroy();
+});
 test("net front: Connection: close and HTTP/1.0 go to node:http", async () => {
   const cookie = await login("u1@example.test");
   const path = "/users/me/sidebar";
   const a = conn();
-  a.send(req(path, cookie));
-  await a.wait(1);
+  a.send(ODD + req(path, cookie));
+  await a.wait(2);
   const hits = rawFastStats.hits;
   const c = conn();
   c.send(req(path, cookie, "Connection: close\r\n"));

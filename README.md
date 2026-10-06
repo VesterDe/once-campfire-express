@@ -61,8 +61,10 @@ connection in both runs.
   again on every request. The masked token is still valid for that session; only the
   per-request BREACH re-masking is weaker within that second.
 - Workers accept connections with a plain `net.Server` (set `NET_FRONT=0` to use node:http
-  directly). It answers raw repeat hits itself with the same bytes node:http would send and
-  hands every other connection to node:http at its first non-hit request. Before that
+  directly). It answers raw repeat hits itself with the same bytes node:http would send,
+  serves other plain keep-alive GETs through the same request handler with node's own
+  request/response objects, and hands every other connection (POST, upgrade, HTTP/1.0,
+  `Connection: close`, unusual header syntax) to node:http for good. Before that
   hand-off, node:http's header and request timeouts do not apply; an idle socket still
   closes after the keep-alive timeout.
 - Backups require a maintenance window for consistent database and file snapshots. App and
