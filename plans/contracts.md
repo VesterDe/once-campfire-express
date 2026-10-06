@@ -158,6 +158,14 @@ package; the `etag` setting stays `weak`), `publishMessage` returns before it
 builds anything when `publish()` would drop it (no WebSocket in any worker),
 the push endpoint check is memoized per endpoint string, and `notifyMessage`
 runs the push-subscriptions query only when some member passes the
-involvement and connection checks. Tried and dropped: one IPC message per tick
+involvement and connection checks. With several workers the primary also
+reads each room's members (user id, involvement, connected_at, role, status)
+and its push-permitted users once per batch, inside the write transaction (its
+page cache is warm), and sends them with every reply; the worker uses them for
+the unread broadcasts and push/webhook jobs instead of two reads on a page
+cache the commit just made cold. They show the rows as of the post's commit
+(the worker read them a moment after it). If that read fails, the worker reads
+them itself. Checked: same push jobs per post with 1 and 3 workers and with
+the previous build (permitted endpoints, 3 jobs per post), npm test, parity. Tried and dropped: one IPC message per tick
 for posts and per batch for replies (no CPU change, lower throughput); 2, 3 and
 6 workers instead of 4 (all slower on the 3-CPU post bench).
