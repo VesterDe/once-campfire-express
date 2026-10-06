@@ -537,21 +537,26 @@ function rawFast(e, req, res) {
     )
       return false;
   }
-  const r = fastPageBody(e.page, e.csrf, e.gzipOk);
-  if (r === null) return false;
-  const body = r.body,
-    etag = r.etag;
-  const h = e.template.slice(),
-    s = e.slots;
-  h[s.len] = String(body.length);
-  if (s.etag !== undefined) h[s.etag] = etag;
-  if (s.cookies !== undefined) {
-    const x = expiresText(t);
-    for (const [i, a, b] of s.cookies) h[i] = a + x + b;
+  // Body and headers are built once per entry per clock second: the CSRF
+  // mask, ETag and cookie Expires stay the same within that second.
+  const sec = Math.floor(t / 1000);
+  let c = e.built;
+  if (c === undefined || c.sec !== sec) {
+    const r = fastPageBody(e.page, e.csrf, e.gzipOk);
+    if (r === null) return false;
+    const h = e.template.slice(),
+      s = e.slots;
+    h[s.len] = String(r.body.length);
+    if (s.etag !== undefined) h[s.etag] = r.etag;
+    if (s.cookies !== undefined) {
+      const x = expiresText(t);
+      for (const [i, a, b] of s.cookies) h[i] = a + x + b;
+    }
+    c = e.built = { sec, h, body: r.body };
   }
   rawFastStats.hits++;
-  res.writeHead(e.status, h);
-  res.end(body);
+  res.writeHead(e.status, c.h);
+  res.end(c.body);
   return true;
 }
 export function createApp() {
