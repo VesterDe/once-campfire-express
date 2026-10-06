@@ -552,6 +552,8 @@ const INPUT_HEAD = Buffer.from(
   ),
   INPUT_TAIL = Buffer.from('">');
 const WINDOW_GAP = 30000;
+const GZ_LEVEL = +process.env.PAGE_GZ_LEVEL || 6,
+  GZ_MEM = +process.env.PAGE_GZ_MEM || 8;
 function placeholder(L) {
   const sym = [0xc0, 0xc1, 0xf5, 0xf6, 0xf7, 0xf8, 0xf9, 0xfa, 0xfb, 0xfc, 0xfd, 0xfe, 0xff];
   const k = sym.length,
@@ -629,6 +631,8 @@ function templateGzip(page, L) {
   const deflate = (end, finish) => {
     const options = {
       finishFlush: finish ? zlib.constants.Z_FINISH : zlib.constants.Z_SYNC_FLUSH,
+      level: GZ_LEVEL,
+      memLevel: GZ_MEM,
     };
     if (start > 0)
       options.dictionary = tpl.subarray(Math.max(0, start - 32768), start);
