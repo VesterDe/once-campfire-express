@@ -14,8 +14,9 @@ docker run --rm -p 8080:80 -e SECRET_KEY_BASE="$(openssl rand -hex 64)" \
 
 Existing installs must reuse their `SECRET_KEY_BASE` and mount their storage at
 `/rails/storage`. Preserve VAPID keys for existing push subscriptions. `WEB_WORKERS`
-sets the HTTP process count; publications pass through the primary process to every
-worker. A separate leased SQLite queue handles jobs. TLS terminates at a proxy;
+sets the HTTP process count (default: available CPUs); publications pass through the
+primary process to workers that hold WebSocket connections, and the primary is the
+only writer for new messages without attachments (group commit). A separate leased SQLite queue handles jobs. TLS terminates at a proxy;
 configure `TRUSTED_PROXIES` with its addresses.
 
 For local development, use the pinned Node version, run `npm ci`,
@@ -52,6 +53,20 @@ connection in both runs.
   rebuilding previews as needed. Native-library media bytes can differ.
 - HTML whitespace and malformed-fragment repair can differ. Full byte parity is not claimed.
 - Direct-room autocomplete explicitly requests JSON, repairing the original fetch-header bug.
+- A session cookie re-sent for the same old cookie and same new session within one second is
+  reused, so its embedded expiry can be up to one second older than the response time.
+- A byte-identical repeat of a hot GET (same URL, client address and raw headers) answered by
+  the raw repeat path reuses the body built earlier in the same clock second, so its CSRF
+  mask (and the ETag) is the same for every such repeat in that second. Rails masks the token
+  again on every request. The masked token is still valid for that session; only the
+  per-request BREACH re-masking is weaker within that second.
+- Workers accept connections with a plain `net.Server` (set `NET_FRONT=0` to use node:http
+  directly). It answers raw repeat hits itself with the same bytes node:http would send,
+  serves other plain keep-alive GETs through the same request handler with node's own
+  request/response objects, and hands every other connection (POST, upgrade, HTTP/1.0,
+  `Connection: close`, unusual header syntax) to node:http for good. Before that
+  hand-off, node:http's header and request timeouts do not apply; an idle socket still
+  closes after the keep-alive timeout.
 - Backups require a maintenance window for consistent database and file snapshots. App and
   queue snapshots are separate; external job effects have at-least-once delivery.
 

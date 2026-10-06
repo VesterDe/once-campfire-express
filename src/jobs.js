@@ -1,4 +1,5 @@
 import { DatabaseSync } from "node:sqlite";
+import cluster from "node:cluster";
 import fs from "node:fs";
 import path from "node:path";
 import crypto from "node:crypto";
@@ -14,6 +15,27 @@ import {
   stagedFiles,
 } from "./storage.js";
 
+// Rails Push::Subscription: deliver only to https on port 443 at a permitted push service host.
+const PERMITTED_PUSH_HOSTS = [
+  "jmt17.google.com",
+  "fcm.googleapis.com",
+  "updates.push.services.mozilla.com",
+  "web.push.apple.com",
+  "notify.windows.com",
+];
+export function permittedPushEndpoint(endpoint) {
+  if (!endpoint || /\s/.test(endpoint)) return false;
+  let url;
+  try {
+    url = new URL(endpoint);
+  } catch {
+    return false;
+  }
+  if (url.protocol !== "https:" || (url.port !== "" && url.port !== "443"))
+    return false;
+  const host = url.hostname.toLowerCase();
+  return PERMITTED_PUSH_HOSTS.some((h) => host === h || host.endsWith("." + h));
+}
 let connection,
   timer,
   working = false,
@@ -31,32 +53,85 @@ export function jobsDb() {
   fs.mkdirSync(path.dirname(path.resolve(file)), { recursive: true });
   connection = new DatabaseSync(file);
   connection.exec(
-    "PRAGMA busy_timeout=10000;PRAGMA journal_mode=WAL;CREATE TABLE IF NOT EXISTS jobs(id INTEGER PRIMARY KEY,payload TEXT NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,available_at REAL NOT NULL,lease_until REAL,lease_token TEXT,status TEXT NOT NULL DEFAULT 'ready',last_error TEXT)",
+    "PRAGMA busy_timeout=10000;PRAGMA journal_mode=WAL;PRAGMA synchronous=NORMAL;CREATE TABLE IF NOT EXISTS jobs(id INTEGER PRIMARY KEY,payload TEXT NOT NULL,attempts INTEGER NOT NULL DEFAULT 0,available_at REAL NOT NULL,lease_until REAL,lease_token TEXT,status TEXT NOT NULL DEFAULT 'ready',last_error TEXT)",
   );
+  // Same as db.js: HTTP workers never checkpoint inside a request; the primary does it on a timer.
+  if (cluster.isWorker) connection.exec("PRAGMA wal_autocheckpoint=0;");
+  else if (Number(process.env.WEB_WORKERS || "1") > 1)
+    setInterval(() => {
+      try {
+        connection.exec("PRAGMA wal_checkpoint(PASSIVE);");
+      } catch {}
+    }, 1000).unref();
   return connection;
+}
+const statements = new Map();
+function prepared(sql) {
+  let s = statements.get(sql);
+  if (!s) statements.set(sql, (s = jobsDb().prepare(sql)));
+  return s;
 }
 export function enqueue(kind, data) {
   return Number(
-    jobsDb()
-      .prepare("INSERT INTO jobs(payload,available_at) VALUES(?,?)")
-      .run(JSON.stringify({ kind, data }), Date.now() / 1000).lastInsertRowid,
+    prepared("INSERT INTO jobs(payload,available_at) VALUES(?,?)").run(
+      JSON.stringify({ kind, data }),
+      Date.now() / 1000,
+    ).lastInsertRowid,
   );
+}
+// Insert several jobs in one jobs-database transaction. When the jobs database is
+// locked, retry on the event loop instead of blocking in SQLite's busy handler.
+function tryEnqueueMany(list) {
+  const db = jobsDb(),
+    insert = prepared("INSERT INTO jobs(payload,available_at) VALUES(?,?)");
+  db.exec("PRAGMA busy_timeout=0");
+  try {
+    db.exec("BEGIN IMMEDIATE");
+  } catch (error) {
+    if (/busy|locked/i.test(String(error?.message))) return false;
+    throw error;
+  } finally {
+    db.exec("PRAGMA busy_timeout=10000");
+  }
+  try {
+    const at = Date.now() / 1000;
+    for (const [kind, data] of list)
+      insert.run(JSON.stringify({ kind, data }), at);
+    db.exec("COMMIT");
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
+  return true;
+}
+export function enqueueMany(list) {
+  if (!list.length || tryEnqueueMany(list)) return;
+  const started = Date.now();
+  const retry = () => {
+    try {
+      if (Date.now() - started > 10000)
+        // Same limit as busy_timeout: stop yielding and wait in SQLite like enqueue() does.
+        for (const [kind, data] of list) enqueue(kind, data);
+      else if (!tryEnqueueMany(list)) setImmediate(retry);
+    } catch (error) {
+      console.error("Campfire enqueue failed:", error.message);
+    }
+  };
+  setImmediate(retry);
 }
 export function claim(at = Date.now() / 1000) {
   const db = jobsDb();
   db.exec("BEGIN IMMEDIATE");
   try {
-    const row = db
-      .prepare(
-        "SELECT * FROM jobs WHERE status='ready' AND available_at<=? AND (lease_until IS NULL OR lease_until<=?) ORDER BY id LIMIT 1",
-      )
-      .get(at, at);
+    const row = prepared(
+      "SELECT * FROM jobs WHERE status='ready' AND available_at<=? AND (lease_until IS NULL OR lease_until<=?) ORDER BY id LIMIT 1",
+    ).get(at, at);
     if (!row) {
       db.exec("COMMIT");
       return null;
     }
     const token = crypto.randomBytes(16).toString("hex");
-    db.prepare(
+    prepared(
       "UPDATE jobs SET attempts=attempts+1,lease_until=?,lease_token=? WHERE id=?",
     ).run(at + 120, token, row.id);
     db.exec("COMMIT");
@@ -72,22 +147,20 @@ export function claim(at = Date.now() / 1000) {
   }
 }
 export function finish(job, error = null, at = Date.now() / 1000) {
-  const db = jobsDb();
   if (!error)
-    return db
-      .prepare("DELETE FROM jobs WHERE id=? AND lease_token=?")
-      .run(job.id, job.lease_token).changes;
-  return db
-    .prepare(
-      "UPDATE jobs SET lease_until=NULL,lease_token=NULL,available_at=?,status=?,last_error=? WHERE id=? AND lease_token=?",
-    )
-    .run(
-      at + Math.min(300, 2 ** job.attempts),
-      job.attempts >= 5 ? "dead" : "ready",
-      String(error).slice(0, 1000),
+    return prepared("DELETE FROM jobs WHERE id=? AND lease_token=?").run(
       job.id,
       job.lease_token,
     ).changes;
+  return prepared(
+    "UPDATE jobs SET lease_until=NULL,lease_token=NULL,available_at=?,status=?,last_error=? WHERE id=? AND lease_token=?",
+  ).run(
+    at + Math.min(300, 2 ** job.attempts),
+    job.attempts >= 5 ? "dead" : "ready",
+    String(error).slice(0, 1000),
+    job.id,
+    job.lease_token,
+  ).changes;
 }
 export async function perform(kind, data) {
   if (kind === "purge") {
@@ -256,6 +329,7 @@ export async function perform(kind, data) {
       "SELECT * FROM push_subscriptions WHERE user_id=?",
       data.user_id,
     )) {
+      if (!permittedPushEndpoint(subscription.endpoint)) continue;
       let resolved;
       try {
         resolved = await resolvePublic(subscription.endpoint);
@@ -298,9 +372,9 @@ export async function workOnce() {
   if (!job) return false;
   const heartbeat = setInterval(() => {
     try {
-      jobsDb()
-        .prepare("UPDATE jobs SET lease_until=? WHERE id=? AND lease_token=?")
-        .run(Date.now() / 1000 + 120, job.id, job.lease_token);
+      prepared(
+        "UPDATE jobs SET lease_until=? WHERE id=? AND lease_token=?",
+      ).run(Date.now() / 1000 + 120, job.id, job.lease_token);
     } catch (error) {
       console.error("Campfire lease renewal failed:", error.message);
     }
@@ -325,7 +399,10 @@ export function startWorker() {
     if (working || stopping) return;
     working = true;
     try {
-      await workOnce();
+      // Drain the queue for up to ~20 ms per tick, yielding between jobs.
+      const until = Date.now() + 20;
+      while ((await workOnce()) && !stopping && Date.now() < until)
+        await new Promise((resolve) => setImmediate(resolve));
     } catch (error) {
       console.error("Campfire queue failed:", error.message);
     } finally {
