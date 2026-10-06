@@ -195,6 +195,11 @@ function flush() {
   if (cluster.isWorker) process.send?.(event);
   else forward(event);
 }
+// False when publish() would drop everything (no socket anywhere it could reach).
+export function publishable() {
+  if (!clustered) return clients.size > 0;
+  return cluster.isWorker ? any || clients.size > 0 : has.size > 0;
+}
 export function publish(stream, message) {
   if (!clustered) return deliver(stream, message);
   if (cluster.isWorker ? !any && !clients.size : !has.size) return;

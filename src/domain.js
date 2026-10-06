@@ -7,7 +7,7 @@ import {
   mentionIds,
   reconcileEmbeds,
 } from "./richtext.js";
-import { publish } from "./cable.js";
+import { publish, publishable } from "./cable.js";
 import { stream } from "./rails.js";
 import { fragment, messageData } from "./rendering.js";
 import { enqueue, enqueueMany, permittedPushEndpoint } from "./jobs.js";
@@ -327,7 +327,7 @@ export function publishMessage(
 ) {
   const room =
     knownRoom || get("SELECT * FROM rooms WHERE id=?", message.room_id);
-  if (!room) return;
+  if (!room || !publishable()) return;
   const target =
     action === "append"
       ? `messages_rooms_${room.type.split("::").pop().toLowerCase()}_${room.id}`
