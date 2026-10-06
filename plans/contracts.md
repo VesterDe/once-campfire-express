@@ -58,6 +58,20 @@ request anyway); brotli, deflate, identity and HEAD still go through the
 normal middleware. Verified by decoding with Node zlib and by the parity
 harness.
 
+Below the page cache there are three more caches with the same epoch rule.
+`messagesForRoom` (`src/domain.js`) keeps the row list of each room query
+(room id + before/after/around) and freezes the list and its rows; the epoch
+is read before the query, so a list is never filed under a newer epoch than
+its data. The message entries made for one such list are kept with it. Layout
+pieces (the page text between CSRF tokens and the message list) are kept by
+their exact text with their deflate stream and CRC-32. The gzip trailer CRC is
+made with zlib's crc32_combine arithmetic from the per-piece CRCs, so a request
+does not pass over the whole page. None of these is a stored response: the
+page is still joined per request with a fresh CSRF mask. A joined page with a
+token gets the ETag `W/"<length>-<boot id><page id><kind>.<CRC-32 of the
+token>"` (no SHA-1 per request); it still changes whenever the body does,
+except for a 1 in 2^32 chance between two tokens on the same page.
+
 Sidebar room list (`sidebarState` in `src/routes.js`): the HTML of one user's
 room list (direct and shared rooms, from `sidebarRooms` in
 `src/fast_templates.js`) and the account's room-creation rule are kept per
