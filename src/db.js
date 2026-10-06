@@ -38,13 +38,22 @@ export function initialize(
     "PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA journal_size_limit=67108864; PRAGMA mmap_size=134217728;",
   );
   // HTTP workers never checkpoint inside a request; the primary does it on a timer.
-  if (cluster.isWorker) connection.exec("PRAGMA wal_autocheckpoint=0;");
-  else if (Number(process.env.WEB_WORKERS || "1") > 1)
-    setInterval(() => {
-      try {
-        connection.exec("PRAGMA wal_checkpoint(PASSIVE);");
-      } catch {}
-    }, 1000).unref();
+  // With several workers the primary is the writer for posts (post_writer.js), so it
+  // never checkpoints either: each HTTP worker runs a PASSIVE checkpoint on its own
+  // timer, outside requests, which does not block the writer.
+  if (Number(process.env.WEB_WORKERS || "1") > 1) {
+    connection.exec("PRAGMA wal_autocheckpoint=0;");
+    if (cluster.isWorker)
+      setTimeout(
+        () =>
+          setInterval(() => {
+            try {
+              connection.exec("PRAGMA wal_checkpoint(PASSIVE);");
+            } catch {}
+          }, 1000).unref(),
+        Math.random() * 1000,
+      ).unref();
+  }
   return connection;
 }
 const statements = new Map();
