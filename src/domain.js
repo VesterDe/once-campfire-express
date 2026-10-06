@@ -7,7 +7,7 @@ import {
   mentionIds,
   reconcileEmbeds,
 } from "./richtext.js";
-import { publish } from "./cable.js";
+import { publish, publishable } from "./cable.js";
 import { stream } from "./rails.js";
 import { fragment, messageData } from "./rendering.js";
 import { enqueue, enqueueMany, permittedPushEndpoint } from "./jobs.js";
@@ -327,7 +327,7 @@ export function publishMessage(
 ) {
   const room =
     knownRoom || get("SELECT * FROM rooms WHERE id=?", message.room_id);
-  if (!room) return;
+  if (!room || !publishable()) return;
   const target =
     action === "append"
       ? `messages_rooms_${room.type.split("::").pop().toLowerCase()}_${room.id}`
@@ -356,10 +356,24 @@ export const roomMembers = (roomId) =>
 export const createdBody = (message) => createdContent.get(message);
 export const rememberCreated = (message, content) =>
   createdContent.set(message, content);
+// Members and push-subscribed users of a room as the post writer read them
+// inside the commit of the post (see post_writer.js): the HTTP worker then
+// does not read them again from a page cache the commit just invalidated.
+const createdAudience = new WeakMap();
+export const rememberAudience = (message, audience) =>
+  createdAudience.set(message, audience);
+export const roomAudience = (roomId) => ({
+  members: all(
+    "SELECT m.user_id,m.involvement,m.connected_at,u.role,u.status FROM memberships m LEFT JOIN users u ON u.id=m.user_id WHERE m.room_id=?",
+    Number(roomId),
+  ),
+  pushable: [...pushableUsers(Number(roomId))],
+});
 export function announceMessage(message, html, room) {
-  const members = roomMembers(room.id);
+  const a = createdAudience.get(message);
+  const members = a ? a.members : roomMembers(room.id);
   publishMessage(message, "append", html, room, members);
-  notifyMessage(message, {}, room, members);
+  notifyMessage(message, {}, room, members, a ? new Set(a.pushable) : null);
 }
 function pushableUsers(roomId) {
   const users = new Set();
@@ -375,6 +389,7 @@ export function notifyMessage(
   { webhooks = true } = {},
   knownRoom = null,
   members = null,
+  knownPushable = null,
 ) {
   const content = createdContent.get(message);
   const body =
@@ -391,7 +406,7 @@ export function notifyMessage(
     room = knownRoom || get("SELECT * FROM rooms WHERE id=?", message.room_id);
   const jobs = [];
   // A push job only for users with a subscription Rails would deliver to.
-  let pushable = null;
+  let pushable = knownPushable;
   for (const m of members ||
     all(
       "SELECT m.*,u.role,u.status FROM memberships m JOIN users u ON u.id=m.user_id WHERE m.room_id=? AND m.user_id<>?",
@@ -406,12 +421,14 @@ export function notifyMessage(
     )
       for (const w of all("SELECT id FROM webhooks WHERE user_id=?", m.user_id))
         jobs.push(["webhook", { webhook_id: w.id, message_id: message.id }]);
+    // Cheap membership checks first: the subscriptions query runs only when
+    // some member would get a push.
     if (
-      (pushable ??= pushableUsers(message.room_id)).has(m.user_id) &&
+      (m.involvement === "everything" ||
+        (m.involvement === "mentions" && mentions.has(m.user_id))) &&
       (!m.connected_at ||
         Date.now() - Date.parse(m.connected_at + "Z") > 60000) &&
-      (m.involvement === "everything" ||
-        (m.involvement === "mentions" && mentions.has(m.user_id)))
+      (pushable ??= pushableUsers(message.room_id)).has(m.user_id)
     )
       jobs.push(["push", { user_id: m.user_id, message_id: message.id }]);
   }

@@ -2,7 +2,13 @@ import cluster from "node:cluster";
 import { transaction, writeTransaction } from "./db.js";
 import { stagedFiles } from "./storage.js";
 import { sanitize, plainText } from "./richtext.js";
-import { createMessage, applyUnread, rememberCreated } from "./domain.js";
+import {
+  createMessage,
+  applyUnread,
+  rememberCreated,
+  rememberAudience,
+  roomAudience,
+} from "./domain.js";
 // Group commit: posts without attachments that arrive while the write lock is being
 // acquired share one transaction (each in its own savepoint). Every response is
 // sent only after the shared COMMIT.
@@ -32,6 +38,26 @@ function queueLocal(roomId, userId, body, clientId, content, plain) {
 }
 const create = (p) =>
   (p.message = createMessage(p.roomId, p.userId, p.body, p.clientId, true, p));
+// Clustered primary: read each room's audience once per batch, inside the
+// write transaction (warm cache), and send it with every reply.
+const audienceOf = new WeakMap();
+function audiences(batch) {
+  if (!primaryWriter) return;
+  const byRoom = new Map();
+  for (const p of batch) {
+    if (p.error || !p.message) continue;
+    let a = byRoom.get(p.roomId);
+    if (a === undefined) {
+      try {
+        a = roomAudience(p.roomId);
+      } catch {
+        a = null; // the worker reads it itself
+      }
+      byRoom.set(p.roomId, a);
+    }
+    if (a) audienceOf.set(p.message, a);
+  }
+}
 async function flushPosts() {
   try {
     while (postQueue.length) {
@@ -48,6 +74,7 @@ async function flushPosts() {
               create(p);
             }
             applyUnread(batch.map((p) => p.unread));
+            audiences(batch);
           }),
         );
       } catch {
@@ -71,6 +98,7 @@ async function flushPosts() {
                     p.error = error;
                   }
                 applyUnread(batch.filter((p) => !p.error).map((p) => p.unread));
+                audiences(batch);
               }),
             ),
           );
@@ -86,6 +114,7 @@ async function flushPosts() {
   }
 }
 const clustered = Number(process.env.WEB_WORKERS || "1") > 1;
+const primaryWriter = clustered && cluster.isPrimary;
 const remote = clustered && cluster.isWorker;
 const pending = new Map();
 let seq = 0;
@@ -104,6 +133,7 @@ if (remote)
       );
     else {
       rememberCreated(event.message, p.content);
+      if (event.audience) rememberAudience(event.message, event.audience);
       p.resolve(event.message);
     }
   });
@@ -119,7 +149,13 @@ if (clustered && cluster.isPrimary)
       event.content,
       event.plain,
     ).then(
-      (message) => reply({ type: "post-done", id: event.id, message }),
+      (message) =>
+        reply({
+          type: "post-done",
+          id: event.id,
+          message,
+          audience: audienceOf.get(message),
+        }),
       (error) => {
         if (!(Number(error?.status) < 500))
           console.error(error?.stack || error);

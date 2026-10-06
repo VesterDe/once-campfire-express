@@ -23,7 +23,16 @@ const PERMITTED_PUSH_HOSTS = [
   "web.push.apple.com",
   "notify.windows.com",
 ];
+const permittedSeen = new Map();
 export function permittedPushEndpoint(endpoint) {
+  let v = permittedSeen.get(endpoint);
+  if (v === undefined) {
+    if (permittedSeen.size >= 10000) permittedSeen.clear();
+    permittedSeen.set(endpoint, (v = permittedUncached(endpoint)));
+  }
+  return v;
+}
+function permittedUncached(endpoint) {
   if (!endpoint || /\s/.test(endpoint)) return false;
   let url;
   try {

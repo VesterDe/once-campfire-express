@@ -2,7 +2,7 @@ import express from "express";
 import compression from "compression";
 import multer from "multer";
 import path from "node:path";
-import { randomBytes } from "node:crypto";
+import { randomBytes, hash as cryptoHash } from "node:crypto";
 import zlib from "node:zlib";
 import { createRequire } from "node:module";
 import * as rails from "./rails.js";
@@ -258,11 +258,16 @@ function contentCoding(header) {
 }
 const HOT_PATH =
   /^\/(?:rooms\/\d+(?:\/messages)?|users\/me\/sidebar|searches)$/;
+const POST_PATH = /^\/rooms\/\d+\/messages$/;
 const NO_TRANSFORM = /(?:^|,)\s*?no-transform\s*?(?:,|$)/;
 function encodingMiddleware() {
   const compress = compression();
   return (req, res, next) => {
     const method = contentCoding(req.headers["accept-encoding"]);
+    // Posting a message: answer without gzip (identity is always acceptable;
+    // the ~8 KB turbo stream costs more CPU to gzip than it saves).
+    if (method === "gzip" && req.method === "POST" && POST_PATH.test(req.path))
+      return wrap(req, res, "identity", next);
     if (
       method === "br" ||
       method === "deflate" ||
@@ -598,6 +603,18 @@ export function createApp() {
   const app = express();
   app.disable("x-powered-by");
   app.set("query parser", "extended");
+  // Express' weak ETag ("etag" package), with a one-shot SHA-1. The "etag"
+  // setting stays "weak" (the cached page paths check it).
+  app.set("etag fn", (body, encoding) => {
+    const buf = Buffer.isBuffer(body) ? body : Buffer.from(body, encoding);
+    return buf.length === 0
+      ? 'W/"0-2jmj7l5rSw0yVb/vlWAYkK/YBwk"'
+      : 'W/"' +
+          buf.length.toString(16) +
+          "-" +
+          cryptoHash("sha1", buf, "base64").substring(0, 27) +
+          '"';
+  });
   if (process.env.TRUSTED_PROXIES)
     app.set("trust proxy", process.env.TRUSTED_PROXIES.split(","));
   app.use((req, res, next) => {
