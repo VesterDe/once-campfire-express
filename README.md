@@ -67,6 +67,10 @@ connection in both runs.
   `Connection: close`, unusual header syntax) to node:http for good. Before that
   hand-off, node:http's header and request timeouts do not apply; an idle socket still
   closes after the keep-alive timeout.
+  Front hits read the database change marker at most once per event-loop turn. A GET
+  that is pipelined behind an unanswered request on the same connection can, in rare
+  timing, get the page from just before another process's write; a client that waits
+  for each response (browsers, the benchmark) always sees the write.
 - The answer to posting a message (`POST /rooms/:id/messages`) is sent without gzip, also
   when the client accepts gzip (identity is always an acceptable coding). Rails gzips it.
   The body and all other headers are the same; gzip of the ~8 KB turbo stream cost more

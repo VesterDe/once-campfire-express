@@ -9,7 +9,54 @@
 import net from "node:net";
 import { IncomingMessage, ServerResponse } from "node:http";
 import { netFast } from "./app.js";
-import { epoch } from "./db.js";
+import { turnEpoch } from "./db.js";
+
+// Direct stream handle access (the same calls net.Socket makes internally):
+// hit responses go straight to handle.writeBuffer and request bytes come
+// straight from handle.onread, skipping the Readable/Writable machinery.
+// Falls back to socket.write / 'data' when the binding is not available.
+let SW = null;
+try {
+  const b = process.binding("stream_wrap");
+  if (
+    typeof b.WriteWrap === "function" &&
+    b.streamBaseState &&
+    typeof b.kReadBytesOrError === "number" &&
+    process.env.NETFRONT_DIRECT !== "0"
+  )
+    SW = b;
+} catch {
+  SW = null;
+}
+function wrote(status) {
+  this.buffer = null;
+  if (status < 0) {
+    const s = this.socket;
+    if (s && !s.destroyed) s.destroy();
+  }
+}
+function directWrite(socket, buf) {
+  const h = socket._handle;
+  if (
+    SW === null ||
+    !h ||
+    socket.writableLength !== 0 ||
+    socket.destroyed ||
+    typeof h.writeBuffer !== "function"
+  ) {
+    socket.write(buf);
+    return;
+  }
+  const req = new SW.WriteWrap();
+  req.handle = h;
+  req.oncomplete = wrote;
+  req.async = false;
+  req.bytes = 0;
+  req.buffer = buf;
+  req.socket = socket;
+  const err = h.writeBuffer(req, buf);
+  if (err !== 0) socket.destroy();
+}
 
 const HEADER =
   /^([!#$%&'*+\-.^_`|~0-9A-Za-z]+):[ \t]*([\x21-\x7e](?:[\x20-\x7e]*[\x21-\x7e])?)$/;
@@ -51,16 +98,27 @@ function lookupHead(text) {
   return p;
 }
 
+let tailKat = NaN,
+  tailText = "";
 export function createFront(httpServer) {
   const open = new Set();
   const front = net.createServer({ noDelay: true }, (socket) => {
     open.add(socket);
-    let pending = null;
+    let pending = null,
+      lastBuf = null,
+      lastP = null;
+    const hint = { gen: -1, raw: null, e: null };
     const addr = socket.remoteAddress;
+    const handle = socket._handle;
+    const origRead =
+      SW !== null && handle && typeof handle.onread === "function"
+        ? handle.onread
+        : null;
     const idle = httpServer.keepAliveTimeout;
     if (idle > 0) socket.setTimeout(idle);
     const handOff = (rest) => {
-      socket.removeListener("data", onData);
+      if (origRead !== null) handle.onread = origRead;
+      else socket.removeListener("data", onData);
       socket.removeListener("timeout", onTimeout);
       socket.removeListener("error", onError);
       socket.removeListener("close", onClose);
@@ -123,25 +181,41 @@ export function createFront(httpServer) {
       pending = null;
       const kat = httpServer.keepAliveTimeout;
       if (httpServer.maxRequestsPerSocket > 0) return handOff(buf);
-      const tail =
-        "Connection: keep-alive\r\n" +
-        (kat > 0
-          ? "Keep-Alive: timeout=" + Math.floor(kat / 1000) + "\r\n"
-          : "");
+      if (kat !== tailKat) {
+        tailKat = kat;
+        tailText =
+          "Connection: keep-alive\r\n" +
+          (kat > 0
+            ? "Keep-Alive: timeout=" + Math.floor(kat / 1000) + "\r\n"
+            : "");
+      }
+      const tail = tailText;
       let ep = -2,
         corked = false;
       for (;;) {
-        const end = buf.indexOf("\r\n\r\n");
+        let end, p;
+        if (lastBuf !== null && buf.equals(lastBuf)) {
+          end = buf.length - 4;
+          p = lastP;
+        } else {
+          end = buf.indexOf("\r\n\r\n");
+          if (end >= 0) {
+            p = lookupHead(buf.latin1Slice(0, end));
+            if (end + 4 === buf.length && p !== null) {
+              lastBuf = Buffer.from(buf);
+              lastP = p;
+            }
+          }
+        }
         if (end < 0) {
           if (buf.length > MAX_HEAD) break;
           if (buf.length) pending = buf;
           if (corked) socket.uncork();
           return;
         }
-        const p = lookupHead(buf.latin1Slice(0, end));
         if (p === null) break;
-        if (ep === -2) ep = epoch();
-        const out = netFast(p.url, p.raw, addr, tail, ep);
+        if (ep === -2) ep = turnEpoch();
+        const out = netFast(p.url, p.raw, addr, tail, ep, hint);
         const rest = buf.subarray(end + 4);
         if (out === null) {
           if (corked) socket.uncork();
@@ -153,7 +227,8 @@ export function createFront(httpServer) {
           socket.cork();
           corked = true;
         }
-        socket.write(out);
+        if (corked) socket.write(out);
+        else directWrite(socket, out);
         buf = rest;
         if (!buf.length) {
           if (corked) socket.uncork();
@@ -166,7 +241,17 @@ export function createFront(httpServer) {
     const onTimeout = () => socket.destroy();
     const onError = () => socket.destroy();
     const onClose = () => open.delete(socket);
-    socket.on("data", onData);
+    if (origRead !== null) {
+      const ofs = SW.kArrayBufferOffset,
+        nr = SW.kReadBytesOrError,
+        st = SW.streamBaseState;
+      handle.onread = function (ab) {
+        const n = st[nr];
+        if (n <= 0 || socket.destroyed) return origRead.call(this, ab);
+        socket._unrefTimer();
+        onData(Buffer.from(ab, st[ofs], n));
+      };
+    } else socket.on("data", onData);
     socket.on("timeout", onTimeout);
     socket.on("error", onError);
     socket.on("close", onClose);
