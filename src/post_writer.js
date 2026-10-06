@@ -40,19 +40,19 @@ async function flushPosts() {
   try {
     while (postQueue.length) {
       let batch = null;
-      // Fast attempt: the whole batch without per-post savepoints.
+      // Fast attempt: the whole batch without any savepoint. (Inside a savepoint
+      // SQLite first copies every existing page it changes to a sub-journal
+      // file, which made the memberships UPDATE ten times slower.)
       try {
         await writeTransaction(() =>
-          stagedFiles(() =>
-            transaction(() => {
-              batch = postQueue.splice(0);
-              for (const p of batch) {
-                p.bare = true;
-                create(p);
-              }
-              applyUnread(batch.map((p) => p.unread));
-            }),
-          ),
+          stagedFiles(() => {
+            batch = postQueue.splice(0);
+            for (const p of batch) {
+              p.bare = true;
+              create(p);
+            }
+            applyUnread(batch.map((p) => p.unread));
+          }),
         );
       } catch {
         // Something failed and everything rolled back: redo the batch with one
