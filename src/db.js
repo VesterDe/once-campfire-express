@@ -47,23 +47,15 @@ export function initialize(
     } catch {
       shmFd = null;
     }
-  // HTTP workers never checkpoint inside a request; the primary does it on a timer.
-  // With several workers the primary is the writer for posts (post_writer.js), so it
-  // never checkpoints either: each HTTP worker runs a PASSIVE checkpoint on its own
-  // timer, outside requests, which does not block the writer.
-  if (Number(process.env.WEB_WORKERS || "1") > 1) {
-    connection.exec("PRAGMA wal_autocheckpoint=0;");
-    if (cluster.isWorker)
-      setTimeout(
-        () =>
-          setInterval(() => {
-            try {
-              connection.exec("PRAGMA wal_checkpoint(PASSIVE);");
-            } catch {}
-          }, 1000).unref(),
-        Math.random() * 1000,
-      ).unref();
-  }
+  // HTTP workers never checkpoint. The primary is the writer for posts
+  // (post_writer.js) and keeps SQLite's automatic checkpoint (every 1000 WAL
+  // pages, right after its own commit). With no other writer appending during it,
+  // that PASSIVE checkpoint can finish, so the WAL restarts instead of growing
+  // without bound (a timer checkpoint never caught up with a busy writer).
+  // 10000 pages (about 40 MB) instead of 1000: hot pages are copied and the
+  // database file synced ten times less often.
+  if (cluster.isWorker) connection.exec("PRAGMA wal_autocheckpoint=0;");
+  else connection.exec("PRAGMA wal_autocheckpoint=10000;");
   return connection;
 }
 const statements = new Map();
