@@ -193,7 +193,10 @@ export function sidebarDirect(d) {
   return `<a class="direct${d.Unread ? " unread" : ""}" id="${e(d.DOM("list"))}" data-sorted-list-number="${e(epoch(d.UpdatedAt))}" data-rooms-list-target="room" data-badge-dot-target="unread" data-sorted-list-target="item" data-room-id="${id}" href="/rooms/${id}">${avatars}<span class="direct__author flex align-center gap max-width min-width border-radius txt-small"><span class="txt-nowrap overflow-ellipsis"><span class="for-screen-reader">Ping with</span>${e(d.Label)}</span></span></a>`;
 }
 
-export function sidebar(d) {
+// The sidebar is cut in three: the head and tail hold the per-user stream
+// names and avatar, the middle holds the room list. The sidebar route keeps
+// the middle per user while the database epoch is unchanged.
+export function sidebarRooms(d) {
   const rooms = d.SidebarRooms || [];
   let directs = "",
     shared = "",
@@ -205,14 +208,23 @@ export function sidebar(d) {
   }
   for (const p of d.Placeholders || [])
     placeholders += `<form class="button_to" method="post" action="/rooms/directs?user_ids%5B%5D=${e(p.ID)}"><button class="direct borderless fill-transparent unpad"><span class="avatar"><img src="${avatar(p.ID, p.UpdatedAt)}" aria-hidden="true"></span><span class="direct__author flex align-center gap max-width min-width border-radius txt-small"><span class="txt-nowrap overflow-ellipsis"><span class="for-screen-reader">Start a ping with</span>${e((p.Name || "").split(" ")[0])}</span></span></button></form>`;
-  const uid = e(d.User?.ID);
+  return `${directs}</div><div contents>${placeholders}</div></div></turbo-frame>
+<div class="rooms position-relative flex flex-column gap"><div id="shared_rooms" contents data-controller="sorted-list">${shared}</div>`;
+}
+export function sidebarHead(d) {
   return `<turbo-frame id="user_sidebar" data-turbo-permanent="true" target="_top" data-controller="rooms-list read-rooms turbo-frame" data-rooms-list-unread-class="unread" data-action="presence:present@window->rooms-list#read read-rooms:read->rooms-list#read turbo:frame-load->rooms-list#loaded refresh-room:visible@window->turbo-frame#reload">
 <turbo-cable-stream-source channel="Turbo::StreamsChannel" signed-stream-name="${e(d.RoomsStream)}"></turbo-cable-stream-source><turbo-cable-stream-source channel="Turbo::StreamsChannel" signed-stream-name="${e(d.UserRoomsStream)}"></turbo-cable-stream-source>
 <div class="sidebar__container overflow-y overflow-hide-scrollbar" data-controller="badge-dot" data-badge-dot-unread-class="unread" data-action="rooms-list:unread@window->badge-dot#update rooms-list:read@window->badge-dot#update turbo:submit-start->turbo-frame#unpermanize">
-<turbo-frame id="direct_rooms_control" target="_top"><div class="directs gap overflow-x overflow-hide-scrollbar"><a class="direct direct__new" data-turbo-frame="_self" href="/rooms/directs/new"><span class="avatar avatar--icon"><img src="${A("messages-add.svg")}" width="20" height="20" aria-hidden="true" class="colorize--black"></span><span class="direct__author flex max-width min-width border-radius pad-inline-half"><span class="for-screen-reader">New</span><span class="txt-small overflow-clip">Ping</span></span></a><div id="direct_rooms" contents data-controller="sorted-list" data-action="rooms-list:unread@window->sorted-list#updateItem">${directs}</div><div contents>${placeholders}</div></div></turbo-frame>
-<div class="rooms position-relative flex flex-column gap"><div id="shared_rooms" contents data-controller="sorted-list">${shared}</div>${d.CanCreateRooms ? `<a class="rooms__new-btn btn room align-center gap txt-reversed" aria-label="New Chat Room" href="/rooms/opens/new"><img src="${A("add.svg")}" width="20" height="20" aria-hidden="true" style="view-transition-name: new-room"></a>` : ""}</div>
+<turbo-frame id="direct_rooms_control" target="_top"><div class="directs gap overflow-x overflow-hide-scrollbar"><a class="direct direct__new" data-turbo-frame="_self" href="/rooms/directs/new"><span class="avatar avatar--icon"><img src="${A("messages-add.svg")}" width="20" height="20" aria-hidden="true" class="colorize--black"></span><span class="direct__author flex max-width min-width border-radius pad-inline-half"><span class="for-screen-reader">New</span><span class="txt-small overflow-clip">Ping</span></span></a><div id="direct_rooms" contents data-controller="sorted-list" data-action="rooms-list:unread@window->sorted-list#updateItem">`;
+}
+export function sidebarTail(d) {
+  const uid = e(d.User?.ID);
+  return `${d.CanCreateRooms ? `<a class="rooms__new-btn btn room align-center gap txt-reversed" aria-label="New Chat Room" href="/rooms/opens/new"><img src="${A("add.svg")}" width="20" height="20" aria-hidden="true" style="view-transition-name: new-room"></a>` : ""}</div>
 <button class="btn sidebar__toggle" data-action="toggle-class#toggle"><img src="${A("menu.svg")}" width="20" height="20" aria-hidden="true"><span class="for-screen-reader">Open menu</span></button></div>
 <div class="flex align-end sidebar__tools gap justify-end"><a class="btn avatar flex-item-no-shrink sidebar__tool" href="/users/me/profile"><img src="${avatar(d.User?.ID, d.User?.UpdatedAt)}" width="48" height="48" aria-hidden="true" style="view-transition-name: avatar-${uid}"><span class="for-screen-reader">My Settings</span></a><a class="btn align-center gap txt-reversed sidebar__tool" href="/account/edit"><img src="${A("settings.svg")}" width="20" height="20" aria-hidden="true" style="view-transition-name: account-settings"><span class="for-screen-reader">Account Settings</span></a></div></turbo-frame>`;
+}
+export function sidebar(d) {
+  return sidebarHead(d) + (d.SidebarMid ?? sidebarRooms(d)) + sidebarTail(d);
 }
 
 /* -------------------------------------------------------------- room page */
