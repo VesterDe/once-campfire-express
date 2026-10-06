@@ -353,28 +353,21 @@ export function registerRoutes(app) {
       if (!room) return res.redirect("/");
       req.lastRoom = room.id;
       req.session.last_room_id = room.id;
-      sendPage(
-        req,
-        res,
-        "room",
-        ep,
-        room.id + "|" + (req.params.messageId ?? ""),
-        () => ({
-          Room: roomData(room, req.user),
-          MessageRows: messagesForRoom(room.id, {
-            around: req.params.messageId,
-          }),
-          MessageOrigin: origin(req),
-          LoadedAt: epoch(room.updated_at),
-          Stream: signStream(rails.stream(room)),
-          Involvement: get(
-            "SELECT involvement FROM memberships WHERE room_id=? AND user_id=?",
-            room.id,
-            req.user.id,
-          ).involvement,
-          Invitation: false,
+      sendPage(req, res, "room", ep, () => ({
+        Room: roomData(room, req.user),
+        MessageRows: messagesForRoom(room.id, {
+          around: req.params.messageId,
         }),
-      );
+        MessageOrigin: origin(req),
+        LoadedAt: epoch(room.updated_at),
+        Stream: signStream(rails.stream(room)),
+        Involvement: get(
+          "SELECT involvement FROM memberships WHERE room_id=? AND user_id=?",
+          room.id,
+          req.user.id,
+        ).involvement,
+        Invitation: false,
+      }));
     },
   );
   app.delete("/rooms/:roomId", login, (req, res) => {
@@ -384,7 +377,7 @@ export function registerRoutes(app) {
     res.redirect("/");
   });
   app.get(["/users/me/sidebar", "/users/:id/sidebar"], login, (req, res) => {
-    sendPage(req, res, "sidebar", cacheEpoch(), "", () => {
+    sendPage(req, res, "sidebar", cacheEpoch(), () => {
       const rooms = roomsForUser(req.user.id).filter(
         (r) => r.involvement !== "invisible",
       );
@@ -451,12 +444,8 @@ export function registerRoutes(app) {
         if (!json && !message) {
           const { before, after, around } = req.query;
           return (
-            sendMessages(
-              req,
-              res,
-              cacheEpoch(),
-              room.id + "|" + JSON.stringify([before, after, around]),
-              () => messagesForRoom(room.id, req.query),
+            sendMessages(req, res, cacheEpoch(), () =>
+              messagesForRoom(room.id, req.query),
             ) || res.sendStatus(204)
           );
         }
@@ -493,7 +482,7 @@ export function registerRoutes(app) {
               : rows.map((m) => serializeMessage(m, req)),
           );
         }
-        return sendPage(req, res, "show-message", cacheEpoch(), null, () => ({
+        return sendPage(req, res, "show-message", cacheEpoch(), () => ({
           MessageRows: rows,
         }));
       }
@@ -1313,7 +1302,7 @@ function registerSearch(app) {
       }
       return res.redirect("/searches?" + new URLSearchParams({ q: query }));
     }
-    sendPage(req, res, "search", cacheEpoch(), query, () => {
+    sendPage(req, res, "search", cacheEpoch(), () => {
       let rows = [];
       if (query) {
         const ids = all(

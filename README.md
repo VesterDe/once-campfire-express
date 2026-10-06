@@ -27,6 +27,13 @@ reference is immutable and pinned at `659f957`.
 See [verification](plans/contracts.md) for tested workflows and remaining limits,
 and [benchmark commands](bench/README.md) for the production comparison.
 
+This branch (`not-crazy-perf`) keeps the normal speed work: fast templates, a
+per-message HTML and gzip-piece cache, cached prepared statements and session lookups,
+a lean router for hot pages and posts, and one group-commit writer for new messages.
+It does not store whole responses: every page is rendered and its CSRF token masked for
+each request, every session cookie is encrypted for each response, and post answers are
+gzipped like other responses.
+
 ## Benchmarks
 
 Measured with 16 concurrent clients on an AMD Ryzen AI MAX+ 395,
@@ -53,24 +60,6 @@ connection in both runs.
   rebuilding previews as needed. Native-library media bytes can differ.
 - HTML whitespace and malformed-fragment repair can differ. Full byte parity is not claimed.
 - Direct-room autocomplete explicitly requests JSON, repairing the original fetch-header bug.
-- A session cookie re-sent for the same old cookie and same new session within one second is
-  reused, so its embedded expiry can be up to one second older than the response time.
-- A byte-identical repeat of a hot GET (same URL, client address and raw headers) answered by
-  the raw repeat path reuses the body built earlier in the same clock second, so its CSRF
-  mask (and the ETag) is the same for every such repeat in that second. Rails masks the token
-  again on every request. The masked token is still valid for that session; only the
-  per-request BREACH re-masking is weaker within that second.
-- Workers accept connections with a plain `net.Server` (set `NET_FRONT=0` to use node:http
-  directly). It answers raw repeat hits itself with the same bytes node:http would send,
-  serves other plain keep-alive GETs through the same request handler with node's own
-  request/response objects, and hands every other connection (POST, upgrade, HTTP/1.0,
-  `Connection: close`, unusual header syntax) to node:http for good. Before that
-  hand-off, node:http's header and request timeouts do not apply; an idle socket still
-  closes after the keep-alive timeout.
-- The answer to posting a message (`POST /rooms/:id/messages`) is sent without gzip, also
-  when the client accepts gzip (identity is always an acceptable coding). Rails gzips it.
-  The body and all other headers are the same; gzip of the ~8 KB turbo stream cost more
-  server CPU than it saved.
 - Backups require a maintenance window for consistent database and file snapshots. App and
   queue snapshots are separate; external job effects have at-least-once delivery.
 

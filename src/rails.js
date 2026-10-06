@@ -11,15 +11,8 @@ import {
 // Rails wire contracts are checked against independently generated golden vectors.
 const keys = new Map();
 let clock = () => new Date();
-export let realClock = true;
 export function setClock(fn) {
   clock = fn || (() => new Date());
-  realClock = !fn;
-}
-// Embedded expiry (ms, or null) of a cookie already read through the cache.
-export function cachedCookieExpiry(kind, name, raw) {
-  const e = cookieCache.get(kind + "\0" + name + "\0" + raw);
-  return e && !e.error ? e.exp : undefined;
 }
 // Only integers with 16+ digits can be unsafe; skip the reviver otherwise.
 export const parseJSON = (text) =>

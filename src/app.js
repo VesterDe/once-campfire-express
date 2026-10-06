@@ -12,7 +12,6 @@ import { registerStorage } from "./storage.js";
 import { registerPublic } from "./public.js";
 import { registerOpengraph } from "./opengraph.js";
 import { allowLogin } from "./rate_limit.js";
-import { pageCurrent, fastPageBody } from "./rendering.js";
 
 export function parseCookies(header = "") {
   const result = Object.create(null);
@@ -77,29 +76,6 @@ function lookupSession(token) {
   session.status = user.status;
   return [session, user];
 }
-// The same incoming cookie that turns into the same new session (for example
-// the room page setting last_room_id on every visit) reuses the value encrypted
-// less than a second ago. Only the embedded expiry can lag by under a second.
-const sessionCookies = new Map();
-function sessionCookie(incoming, json, session, expiry) {
-  const key = (incoming || "") + "\0" + json;
-  const hit = sessionCookies.get(key);
-  if (
-    hit &&
-    hit.secret === process.env.SECRET_KEY_BASE &&
-    hit.expiry <= expiry &&
-    expiry - hit.expiry < 1000
-  )
-    return hit.value;
-  const value = rails.encryptCookie("_campfire_session", session, expiry);
-  if (sessionCookies.size >= 10000) sessionCookies.clear();
-  sessionCookies.set(key, {
-    value,
-    expiry,
-    secret: process.env.SECRET_KEY_BASE,
-  });
-  return value;
-}
 // Process-local copies of rarely changing rows, dropped when epoch() moves.
 let cachedEpoch = null,
   cachedAccount,
@@ -133,7 +109,6 @@ function sessionMiddleware(req, res, next) {
   } catch {
     delete req.session._csrf_token;
   }
-  const freshSession = !req.session.session_id || !req.session._csrf_token;
   req.session.session_id ||= randomBytes(16).toString("hex");
   req.session._csrf_token ||= rails.b64(randomBytes(32));
   req.csrfToken = rails.maskCsrf(rails.decode64(req.session._csrf_token));
@@ -189,12 +164,7 @@ function sessionMiddleware(req, res, next) {
     if (after !== before)
       res.cookie(
         "_campfire_session",
-        sessionCookie(
-          req.cookies._campfire_session,
-          after,
-          req.session,
-          expiry,
-        ),
+        rails.encryptCookie("_campfire_session", req.session, expiry),
         options,
       );
     if (req.clearSessionToken)
@@ -210,8 +180,6 @@ function sessionMiddleware(req, res, next) {
         ...options,
         httpOnly: false,
       });
-    if (req.fastRecord?.page && !freshSession)
-      recordFast(req, this, args, after !== before ? after : null, expiry);
     return writeHead.apply(this, args);
   };
   next();
@@ -258,16 +226,11 @@ function contentCoding(header) {
 }
 const HOT_PATH =
   /^\/(?:rooms\/\d+(?:\/messages)?|users\/me\/sidebar|searches)$/;
-const POST_PATH = /^\/rooms\/\d+\/messages$/;
 const NO_TRANSFORM = /(?:^|,)\s*?no-transform\s*?(?:,|$)/;
 function encodingMiddleware() {
   const compress = compression();
   return (req, res, next) => {
     const method = contentCoding(req.headers["accept-encoding"]);
-    // Posting a message: answer without gzip (identity is always acceptable;
-    // the ~8 KB turbo stream costs more CPU to gzip than it saves).
-    if (method === "gzip" && req.method === "POST" && POST_PATH.test(req.path))
-      return wrap(req, res, "identity", next);
     if (
       method === "br" ||
       method === "deflate" ||
@@ -334,8 +297,6 @@ export function fastPath(app, req, res) {
   if (h["content-length"] !== undefined || h["transfer-encoding"] !== undefined)
     return false;
   const url = req.url;
-  const e = rawFastStats.enabled ? findFast(req) : undefined;
-  if (e !== undefined && rawFast(e, req, res)) return true;
   const q = url.indexOf("?");
   if (!HOT_PATH.test(q < 0 ? url : url.slice(0, q)) || FORMAT_SUFFIX.test(url))
     return false;
@@ -351,260 +312,15 @@ export function fastPath(app, req, res) {
     fastApps.set(app, lean);
   }
   req.body = undefined;
-  req.fastRecord =
-    h["if-none-match"] === undefined &&
-    h["if-modified-since"] === undefined &&
-    rails.realClock &&
-    (h["accept-encoding"] === undefined ||
-      contentCoding(h["accept-encoding"]) === "gzip" ||
-      contentCoding(h["accept-encoding"]) === "identity")
-      ? {}
-      : null;
   lean.handle(req, res);
   return true;
-}
-// ---- Raw fast path --------------------------------------------------------
-// A repeat of a hot GET with byte-identical URL, headers and client address
-// is answered without Express: the first answer (through the normal path)
-// records everything derived from the request; a repeat is served from the
-// same page cache entry with a fresh CSRF mask, ETag and cookie expiry while
-// the db epoch, the page entry, the session cookie memo (1 s), the session
-// activity window and the cookie expiries all still hold. Anything else goes
-// through the normal path.
-const fastEntries = new Map();
-export const rawFastStats = { enabled: true, hits: 0 };
-const MAX_AGE = 20 * 365 * 86400 * 1000;
-// Entries per URL; a request matches an entry when its client address and
-// raw header list (names, values, order) are identical.
-function findFast(req) {
-  const list = fastEntries.get(req.url);
-  if (list === undefined) return undefined;
-  const raw = req.rawHeaders,
-    n = raw.length,
-    addr = req.socket.remoteAddress;
-  next: for (let j = 0; j < list.length; j++) {
-    const e = list[j],
-      r = e.raw;
-    if (r.length !== n || e.addr !== addr) continue;
-    for (let i = n - 1; i >= 0; i--) if (r[i] !== raw[i]) continue next;
-    return e;
-  }
-  return undefined;
-}
-function dropFast(e) {
-  const list = fastEntries.get(e.url);
-  if (list === undefined) return;
-  const i = list.indexOf(e);
-  if (i >= 0) list.splice(i, 1);
-  if (!list.length) fastEntries.delete(e.url);
-}
-let expSecond = -1,
-  expText = "";
-function expiresText(nowMs) {
-  const sec = Math.floor(nowMs / 1000);
-  if (sec !== expSecond) {
-    expText = new Date(nowMs + MAX_AGE).toUTCString();
-    expSecond = sec;
-  }
-  return expText;
-}
-function recordFast(req, res, args, sessionJson, expiry) {
-  const rec = req.fastRecord;
-  req.fastRecord = null;
-  const status = typeof args[0] === "number" ? args[0] : res.statusCode;
-  if (
-    status !== 200 ||
-    args.length > 1 ||
-    !rec.key ||
-    !req.user ||
-    !req.currentSession ||
-    req.authenticatedByBot ||
-    req.clearSessionToken ||
-    req.newSessionToken ||
-    req.method !== "GET" ||
-    req.epoch == null ||
-    req.epoch < 0 ||
-    !pageCurrent(rec.key, rec.page, req.epoch)
-  )
-    return;
-  let csrf;
-  try {
-    csrf = rails.decode64(req.session._csrf_token);
-  } catch {
-    return;
-  }
-  if (csrf.length !== 32) return;
-  const raw = req.cookies;
-  let validUntil =
-    new Date(
-      req.currentSession.last_active_at.replace(" ", "T") + "Z",
-    ).getTime() +
-    3600000 +
-    1;
-  for (const [kind, name] of [
-    ["s", "session_token"],
-    ["e", "_campfire_session"],
-  ]) {
-    if (raw[name] === undefined) continue;
-    if (typeof raw[name] !== "string") return;
-    const exp = rails.cachedCookieExpiry(kind, name, raw[name]);
-    if (exp === undefined) return;
-    if (exp !== null) validUntil = Math.min(validUntil, exp);
-  }
-  if (!(validUntil > Date.now())) return;
-  const expires = "Expires=" + expiry.toUTCString();
-  const template = [],
-    slots = {};
-  let sessValue = null;
-  for (const name of res.getRawHeaderNames()) {
-    const lower = name.toLowerCase();
-    const value = res.getHeader(name);
-    if (lower === "date") return;
-    if (lower === "etag") {
-      slots.etag = template.length + 1;
-      template.push(name, "");
-    } else if (lower === "content-length") {
-      slots.len = template.length + 1;
-      template.push(name, "");
-    } else if (lower === "set-cookie") {
-      for (const c of Array.isArray(value) ? value : [value]) {
-        const at = c.indexOf(expires);
-        if (at < 0) return;
-        if (c.startsWith("_campfire_session=")) {
-          if (sessionJson === null) return;
-          sessValue = c.slice(18, c.indexOf(";"));
-        }
-        (slots.cookies ||= []).push([
-          template.length + 1,
-          c.slice(0, at + 8),
-          c.slice(at + expires.length),
-        ]);
-        template.push(name, "");
-      }
-    } else if (Array.isArray(value)) {
-      for (const v of value) template.push(name, String(v));
-    } else template.push(name, String(value));
-  }
-  if (slots.len === undefined) return;
-  let sessKey = null;
-  if (sessionJson !== null) {
-    if (sessValue === null) return;
-    sessKey = (raw._campfire_session || "") + "\0" + sessionJson;
-    const memo = sessionCookies.get(sessKey);
-    if (!memo || encodeURIComponent(memo.value) !== sessValue) return;
-    sessValue = memo.value;
-  }
-  const old = findFast(req);
-  if (old !== undefined) dropFast(old);
-  if (fastEntries.size >= 1000) fastEntries.clear();
-  let list = fastEntries.get(req.url);
-  if (list === undefined) fastEntries.set(req.url, (list = []));
-  if (list.length >= 64) list.shift();
-  list.push({
-    url: req.url,
-    addr: req.socket.remoteAddress,
-    raw: req.rawHeaders.slice(),
-    epoch: req.epoch,
-    key: rec.key,
-    page: rec.page,
-    gzipOk: rec.gzipOk,
-    csrf,
-    status,
-    template,
-    slots,
-    sessKey,
-    sessValue,
-    validUntil,
-    secret: process.env.SECRET_KEY_BASE,
-  });
-}
-function rawFast(e, req, res) {
-  const c = rawBuilt(e, Date.now(), -2);
-  if (c === null) return false;
-  rawFastStats.hits++;
-  res.writeHead(e.status, c.h);
-  res.end(c.body);
-  return true;
-}
-// Validity checks plus the per-second build. ep is a db epoch already read in
-// this same synchronous run (net front, pipelined batch) or -2 to read it now.
-function rawBuilt(e, t, ep) {
-  if (
-    !(t < e.validUntil) ||
-    !rails.realClock ||
-    e.secret !== process.env.SECRET_KEY_BASE ||
-    (ep === -2 ? epoch() : ep) !== e.epoch ||
-    e.epoch !== cachedEpoch ||
-    !pageCurrent(e.key, e.page, e.epoch)
-  ) {
-    dropFast(e);
-    return null;
-  }
-  if (e.sessKey !== null) {
-    const memo = sessionCookies.get(e.sessKey),
-      expiry = t + MAX_AGE;
-    if (
-      !memo ||
-      memo.value !== e.sessValue ||
-      memo.secret !== e.secret ||
-      !(memo.expiry <= expiry && expiry - memo.expiry < 1000)
-    )
-      return null;
-  }
-  // Body and headers are built once per entry per clock second: the CSRF
-  // mask, ETag and cookie Expires stay the same within that second.
-  const sec = Math.floor(t / 1000);
-  let c = e.built;
-  if (c === undefined || c.sec !== sec) {
-    const r = fastPageBody(e.page, e.csrf, e.gzipOk);
-    if (r === null) return null;
-    const h = e.template.slice(),
-      s = e.slots;
-    h[s.len] = String(r.body.length);
-    if (s.etag !== undefined) h[s.etag] = r.etag;
-    if (s.cookies !== undefined) {
-      const x = expiresText(t);
-      for (const [i, a, b] of s.cookies) h[i] = a + x + b;
-    }
-    c = e.built = { sec, h, body: r.body, net: null, tail: "" };
-  }
-  return c;
-}
-// Net front entry (src/netfront.js): the whole HTTP/1.1 response as one
-// Buffer, byte-identical to what node:http writes for rawFast (headers, then
-// Date, Connection: keep-alive and Keep-Alive), or null to use node:http.
-const fakeReq = { url: "", rawHeaders: null, socket: { remoteAddress: "" } };
-export function netFast(url, rawHeaders, addr, tail, ep) {
-  if (!rawFastStats.enabled) return null;
-  fakeReq.url = url;
-  fakeReq.rawHeaders = rawHeaders;
-  fakeReq.socket.remoteAddress = addr;
-  const e = findFast(fakeReq);
-  if (e === undefined) return null;
-  const t = Date.now();
-  const c = rawBuilt(e, t, ep);
-  if (c === null) return null;
-  if (c.net === null || c.tail !== tail) {
-    const h = c.h;
-    let head = "HTTP/1.1 200 OK\r\n";
-    for (let i = 0; i < h.length; i += 2)
-      head += h[i] + ": " + h[i + 1] + "\r\n";
-    head +=
-      "Date: " + new Date(c.sec * 1000).toUTCString() + "\r\n" + tail + "\r\n";
-    const hb = Buffer.from(head, "latin1");
-    c.net = Buffer.concat([hb, c.body], hb.length + c.body.length);
-    c.tail = tail;
-  }
-  rawFastStats.hits++;
-  return c.net;
 }
 export function createApp() {
   initialize();
   const app = express();
   app.disable("x-powered-by");
   app.set("query parser", "extended");
-  // Express' weak ETag ("etag" package), with a one-shot SHA-1. The "etag"
-  // setting stays "weak" (the cached page paths check it).
+  // Express' weak ETag ("etag" package), with a one-shot SHA-1.
   app.set("etag fn", (body, encoding) => {
     const buf = Buffer.isBuffer(body) ? body : Buffer.from(body, encoding);
     return buf.length === 0

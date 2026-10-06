@@ -154,6 +154,17 @@ test("lean fast-path router repeats responses per user and sees writes from othe
     headers: { cookie: one, "accept-encoding": "gzip" },
   });
   assert.equal(gz.headers.get("content-encoding"), "gzip");
+  // Every page gets a freshly masked CSRF token, as in Rails.
+  const tokens = new Set();
+  for (let i = 0; i < 3; i++) {
+    const html = await (
+      await fetch(base + `/rooms/${room}`, {
+        headers: { cookie: one, "accept-encoding": "gzip" },
+      })
+    ).text();
+    tokens.add(html.match(/name="csrf-token" content="([^"]+)"/)[1]);
+  }
+  assert.equal(tokens.size, 3);
   // A write through another SQLite connection invalidates the cache.
   const outside = new DatabaseSync(join(temp, "db/production.sqlite3"));
   outside.exec(`UPDATE users SET name='Renamed One' WHERE id=${users[0].id}`);
